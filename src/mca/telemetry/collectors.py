@@ -58,6 +58,9 @@ def _disk_info() -> list[dict[str, Any]]:
     """Collect disk usage for mounted partitions."""
     disks = []
     for part in psutil.disk_partitions(all=False):
+        # Skip snap and squashfs mounts
+        if part.fstype in ("squashfs",) or "/snap/" in part.mountpoint:
+            continue
         try:
             usage = psutil.disk_usage(part.mountpoint)
             disks.append({
