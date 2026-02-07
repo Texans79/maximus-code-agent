@@ -1,0 +1,27 @@
+# Maximus Code Agent configuration
+workspace: "."
+approval_mode: ask   # auto | ask | paranoid
+
+llm:
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen2.5-72B-Instruct-AWQ"
+  api_key: "not-needed"
+  temperature: 0.3
+  max_tokens: 4096
+
+shell:
+  timeout: 120
+
+git:
+  auto_checkpoint: true
+  branch_prefix: "mca/"
+
+memory:
+  backend: sqlite
+  sqlite_path: ".mca/memory.db"
+
+style:
+  indent: 4
+  quotes: double
+  docstrings: google
+  max_line_length: 100
