@@ -31,9 +31,9 @@ _DEFAULTS: dict[str, Any] = {
         "branch_prefix": "mca/",
     },
     "memory": {
-        "backend": "sqlite",          # sqlite | postgres
+        "backend": "postgres",         # postgres (primary) | sqlite (emergency fallback)
         "sqlite_path": ".mca/memory.db",
-        "postgres_dsn": "",
+        "postgres_dsn": "",            # resolved from env vars if empty (see base.py)
     },
     "telegram": {
         "token": "",

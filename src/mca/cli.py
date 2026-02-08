@@ -135,16 +135,18 @@ def rollback(
 def memory_add(
     content: str = typer.Argument(..., help="Content to remember."),
     tags: Optional[str] = typer.Option(None, "--tags", "-t", help="Comma-separated tags."),
+    category: str = typer.Option("general", "--category", "-c",
+                                  help="Category: general|decision|recipe|pattern|error|context"),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
 ) -> None:
-    """Store a memory entry."""
+    """Store a knowledge entry in long-term memory."""
     from mca.config import load_config
     from mca.memory.base import get_store
     cfg = load_config(workspace or ".")
     store = get_store(cfg)
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
-    mid = store.add(content=content, tags=tag_list, project=str(Path.cwd()))
-    console.print(f"[success]Stored memory {mid}[/success]")
+    mid = store.add(content=content, tags=tag_list, project=str(Path.cwd()), category=category)
+    console.print(f"[success]Stored memory {mid} ({store.backend_name})[/success]")
 
 
 @memory_app.command("search")
@@ -153,18 +155,20 @@ def memory_search(
     limit: int = typer.Option(5, "--limit", "-n"),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
 ) -> None:
-    """Search stored memories."""
+    """Search stored knowledge entries."""
     from mca.config import load_config
     from mca.memory.base import get_store
     cfg = load_config(workspace or ".")
     store = get_store(cfg)
     results = store.search(query=query, limit=limit)
     if not results:
-        console.print("[dim]No results found.[/dim]")
+        console.print(f"[dim]No results found. (backend: {store.backend_name})[/dim]")
         return
+    console.print(f"[dim]{len(results)} result(s) from {store.backend_name}[/dim]")
     for r in results:
         console.print(Panel(
-            f"{r['content']}\n[dim]tags={r.get('tags',[])} | project={r.get('project','')} | {r.get('created','')}[/dim]",
+            f"{r['content']}\n[dim]category={r.get('category','general')} | "
+            f"tags={r.get('tags',[])} | project={r.get('project','')} | {r.get('created','')}[/dim]",
             border_style="blue",
         ))
 

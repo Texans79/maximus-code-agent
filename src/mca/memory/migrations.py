@@ -1,0 +1,154 @@
+"""PostgreSQL schema migrations for MCA memory tables.
+
+All tables live in the 'mca' schema to avoid collisions with other applications
+sharing the same database.
+
+Tables:
+  mca.tasks        — agent tasks (coding sessions)
+  mca.steps        — individual steps within a task
+  mca.artifacts    — files created/modified by tasks
+  mca.knowledge    — long-term memory entries with embeddings (pgvector)
+  mca.tools        — tool execution log
+  mca.evaluations  — quality evaluations (reviewer verdicts, test results)
+"""
+from __future__ import annotations
+
+MIGRATIONS: list[str] = [
+    # Migration 0: schema + extensions
+    """\
+    CREATE SCHEMA IF NOT EXISTS mca;
+    CREATE EXTENSION IF NOT EXISTS vector;
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    """,
+
+    # Migration 1: core tables
+    """\
+    CREATE TABLE IF NOT EXISTS mca.migrations (
+        version  INTEGER PRIMARY KEY,
+        applied  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS mca.tasks (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        description TEXT NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','running','completed','failed','rolled_back')),
+        workspace   TEXT NOT NULL DEFAULT '',
+        config      JSONB NOT NULL DEFAULT '{}',
+        result      JSONB,
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS mca.steps (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        task_id     UUID NOT NULL REFERENCES mca.tasks(id) ON DELETE CASCADE,
+        seq         INTEGER NOT NULL DEFAULT 0,
+        agent_role  TEXT NOT NULL DEFAULT 'orchestrator',
+        action      TEXT NOT NULL,
+        input       JSONB,
+        output      JSONB,
+        status      TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','running','completed','failed')),
+        duration_ms INTEGER,
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_steps_task ON mca.steps(task_id, seq);
+
+    CREATE TABLE IF NOT EXISTS mca.artifacts (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        task_id     UUID REFERENCES mca.tasks(id) ON DELETE SET NULL,
+        step_id     UUID REFERENCES mca.steps(id) ON DELETE SET NULL,
+        path        TEXT NOT NULL,
+        action      TEXT NOT NULL CHECK (action IN ('created','modified','deleted')),
+        diff        TEXT,
+        content_hash TEXT,
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_artifacts_task ON mca.artifacts(task_id);
+    CREATE INDEX IF NOT EXISTS idx_artifacts_path ON mca.artifacts(path);
+
+    CREATE TABLE IF NOT EXISTS mca.knowledge (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        content     TEXT NOT NULL,
+        tags        TEXT[] NOT NULL DEFAULT '{}',
+        project     TEXT NOT NULL DEFAULT '',
+        category    TEXT NOT NULL DEFAULT 'general'
+                    CHECK (category IN ('general','decision','recipe','pattern','error','context')),
+        metadata    JSONB NOT NULL DEFAULT '{}',
+        embedding   vector(384),
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_knowledge_tags ON mca.knowledge USING gin(tags);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_project ON mca.knowledge(project);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_category ON mca.knowledge(category);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_fts ON mca.knowledge
+        USING gin(to_tsvector('english', content));
+
+    CREATE TABLE IF NOT EXISTS mca.tools (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        task_id     UUID REFERENCES mca.tasks(id) ON DELETE SET NULL,
+        step_id     UUID REFERENCES mca.steps(id) ON DELETE SET NULL,
+        tool_name   TEXT NOT NULL,
+        command     TEXT,
+        exit_code   INTEGER,
+        stdout      TEXT,
+        stderr      TEXT,
+        duration_ms INTEGER,
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_tools_task ON mca.tools(task_id);
+
+    CREATE TABLE IF NOT EXISTS mca.evaluations (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        task_id     UUID REFERENCES mca.tasks(id) ON DELETE CASCADE,
+        step_id     UUID REFERENCES mca.steps(id) ON DELETE SET NULL,
+        evaluator   TEXT NOT NULL DEFAULT 'reviewer',
+        verdict     TEXT NOT NULL CHECK (verdict IN ('approve','reject','request_changes')),
+        issues      JSONB NOT NULL DEFAULT '[]',
+        comments    TEXT,
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_evaluations_task ON mca.evaluations(task_id);
+    """,
+
+    # Migration 2: vector similarity index (IVFFlat requires rows to exist first;
+    # we use HNSW which doesn't)
+    """\
+    DROP INDEX IF EXISTS mca.idx_knowledge_embedding;
+    CREATE INDEX IF NOT EXISTS idx_knowledge_embedding_hnsw
+        ON mca.knowledge USING hnsw (embedding vector_cosine_ops);
+    """,
+]
+
+
+def current_version(conn) -> int:
+    """Get the current migration version from the database."""
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), -1) FROM mca.migrations"
+        ).fetchone()
+        return row[0] if row else -1
+    except Exception:
+        return -1
+
+
+def run_migrations(conn) -> int:
+    """Run pending migrations. Returns number of migrations applied."""
+    applied = 0
+    cur_version = current_version(conn)
+
+    for i, sql in enumerate(MIGRATIONS):
+        if i <= cur_version:
+            continue
+        conn.execute(sql)
+        # Record migration (table may not exist for migration 0)
+        if i > 0:
+            conn.execute(
+                "INSERT INTO mca.migrations (version) VALUES (%s) ON CONFLICT DO NOTHING",
+                (i,),
+            )
+        applied += 1
+
+    return applied
