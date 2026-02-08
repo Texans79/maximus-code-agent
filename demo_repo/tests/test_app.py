@@ -1,5 +1,6 @@
 import unittest
-from app import hello
+import pytest
+from app import hello, power, add, subtract, multiply, divide
 
 class TestApp(unittest.TestCase):
     def test_power(self):
