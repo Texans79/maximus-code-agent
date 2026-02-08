@@ -46,10 +46,9 @@ def start_bot(config: Config) -> None:
             "Commands:\n"
             "/status - System telemetry\n"
             "/run <task> - Run a coding task\n"
+            "/memory <query> - Search past tasks\n"
             "/logs - Recent log entries\n"
             "/rollback - Rollback last change\n"
-            "/approve - Approve pending action\n"
-            "/deny - Deny pending action\n"
         )
 
     async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -86,18 +85,55 @@ def start_bot(config: Config) -> None:
             return
         await update.message.reply_text(f"Starting task: {task}\n(Running in auto mode)")
 
-        # Run in background
         from mca.orchestrator.loop import run_task
         ws = Path(config.workspace).resolve()
 
+        def _run_sync():
+            return run_task(task=task, workspace=ws, config=config, approval_mode="auto")
+
         try:
-            result = run_task(task=task, workspace=ws, config=config, approval_mode="auto")
+            result = await asyncio.to_thread(_run_sync)
             if result.get("success"):
-                await update.message.reply_text(f"Task completed!\n\n{result.get('summary', '')}")
+                summary = result.get("summary", "")
+                iters = result.get("iterations", 0)
+                tools = result.get("tool_calls_made", 0)
+                await update.message.reply_text(
+                    f"Task completed!\n\n{summary}\n\n"
+                    f"Iterations: {iters} | Tool calls: {tools}"
+                )
             else:
-                await update.message.reply_text(f"Task failed: {result.get('error', 'unknown')}")
+                err = result.get("error", result.get("summary", "unknown"))
+                await update.message.reply_text(f"Task failed: {err}")
         except Exception as e:
             await update.message.reply_text(f"Error: {e}")
+
+    async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _check_user(update):
+            return
+        query = " ".join(context.args) if context.args else ""
+        if not query:
+            await update.message.reply_text("Usage: /memory <search query>")
+            return
+        try:
+            from mca.memory.base import get_store
+            from mca.memory.recall import recall_similar
+            from mca.memory.embeddings import get_embedder
+            store = get_store(config)
+            embedder = get_embedder(config)
+            results = recall_similar(store, embedder, query, limit=5)
+            embedder.close()
+            store.close()
+            if not results:
+                await update.message.reply_text("No matching entries found.")
+                return
+            lines = []
+            for r in results:
+                cat = r.get("category", "general")
+                content = r["content"][:200]
+                lines.append(f"[{cat}] {content}")
+            await update.message.reply_text("\n\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"Memory search error: {e}")
 
     async def cmd_rollback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not _check_user(update):
@@ -121,26 +157,15 @@ def start_bot(config: Config) -> None:
         else:
             await update.message.reply_text("No logs found.")
 
-    async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _check_user(update):
-            return
-        await update.message.reply_text("Approved. (Approval queue not yet connected.)")
-
-    async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not _check_user(update):
-            return
-        await update.message.reply_text("Denied. (Approval queue not yet connected.)")
-
     # Build application
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("rollback", cmd_rollback))
     app.add_handler(CommandHandler("logs", cmd_logs))
-    app.add_handler(CommandHandler("approve", cmd_approve))
-    app.add_handler(CommandHandler("deny", cmd_deny))
 
     log.info("Telegram bot starting")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -97,6 +97,33 @@ class TestChatParsing:
         assert resp.tool_calls[0].arguments == {"cmd": "ls"}
 
 
+class TestTokenTracking:
+    def test_tracks_usage_across_calls(self):
+        client = _make_client([
+            {"body": {
+                "choices": [{"message": {"content": "a"}, "finish_reason": "stop"}],
+                "model": "test", "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            }},
+            {"body": {
+                "choices": [{"message": {"content": "b"}, "finish_reason": "stop"}],
+                "model": "test", "usage": {"prompt_tokens": 15, "completion_tokens": 8},
+            }},
+        ])
+        client.chat([{"role": "user", "content": "one"}])
+        client.chat([{"role": "user", "content": "two"}])
+        usage = client.token_usage
+        assert usage["prompt_tokens"] == 25
+        assert usage["completion_tokens"] == 13
+        assert usage["total_tokens"] == 38
+        assert usage["requests"] == 2
+
+    def test_zero_usage_initially(self):
+        client = _make_client([])
+        usage = client.token_usage
+        assert usage["total_tokens"] == 0
+        assert usage["requests"] == 0
+
+
 class TestRetry:
     def test_retries_on_server_error(self):
         client = _make_client([
@@ -159,4 +186,19 @@ class TestLiveVLLM:
         )
         assert resp.content
         assert len(resp.content) > 0
+        # Verify token tracking
+        usage = client.token_usage
+        assert usage["prompt_tokens"] > 0
+        assert usage["completion_tokens"] > 0
+        client.close()
+
+    def test_stream_real(self):
+        client = LLMClient()
+        chunks = list(client.chat_stream(
+            [{"role": "user", "content": "Reply with exactly: STREAM_OK"}],
+            temperature=0.1,
+            max_tokens=50,
+        ))
+        full_text = "".join(chunks)
+        assert len(full_text) > 0
         client.close()

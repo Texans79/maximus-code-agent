@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 from mca.tools.git_ops import GitOps
 
 
@@ -27,6 +27,53 @@ class GitTool(ToolBase):
             "git_diff": "Show current uncommitted changes summary",
             "git_log": "Show recent commit log (oneline)",
         }
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {"type": "function", "function": {
+                "name": "git_checkpoint",
+                "description": "Create a checkpoint commit + tag for safe rollback",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": _param("string", "Optional checkpoint message"),
+                    },
+                    "required": [],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "git_rollback",
+                "description": "Rollback to the most recent MCA checkpoint",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "git_branch",
+                "description": "Create and switch to a new branch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": _param("string", "New branch name"),
+                    },
+                    "required": ["name"],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "git_diff",
+                "description": "Show current uncommitted changes summary",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "git_log",
+                "description": "Show recent commit log (oneline format)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "n": _param("integer", "Number of commits to show (default: 10)"),
+                    },
+                    "required": [],
+                },
+            }},
+        ]
 
     def execute(self, action: str, args: dict[str, Any]) -> ToolResult:
         if action == "git_checkpoint":

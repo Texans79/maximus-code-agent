@@ -20,6 +20,14 @@ class ToolResult:
         return d
 
 
+def _param(type: str, description: str, enum: list[str] | None = None) -> dict:
+    """Helper to build a JSON Schema property."""
+    d: dict[str, Any] = {"type": type, "description": description}
+    if enum:
+        d["enum"] = enum
+    return d
+
+
 class ToolBase(ABC):
     """Abstract base class for all MCA tools.
 
@@ -48,3 +56,21 @@ class ToolBase(ABC):
     def verify(self) -> ToolResult:
         """Self-test. Override for real checks."""
         return ToolResult(ok=True, data={"tool": self.name, "status": "available"})
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        """Return OpenAI-format function definitions for structured calling.
+
+        Override this in subclasses to add parameter schemas.
+        Default: generates basic definitions from actions() with no parameters.
+        """
+        defs = []
+        for action_name, desc in self.actions().items():
+            defs.append({
+                "type": "function",
+                "function": {
+                    "name": action_name,
+                    "description": desc,
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                },
+            })
+        return defs

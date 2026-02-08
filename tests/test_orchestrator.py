@@ -1,11 +1,12 @@
-"""Tests for orchestrator approval, tool parsing, and registry-based dispatch."""
+"""Tests for orchestrator approval, tool dispatch, and done validation."""
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from mca.orchestrator.approval import ApprovalDenied, ApprovalMode, approve_plan
-from mca.orchestrator.loop import _execute_tool, _parse_tool_calls, _build_system_prompt
+from mca.orchestrator.loop import _execute_tool, _build_system_prompt, _validate_done, _build_context
+from mca.llm.client import ToolCall
 
 
 class TestApprovalMode:
@@ -26,25 +27,6 @@ class TestApprovalMode:
             approve_plan("test plan", ApprovalMode.ASK)
 
 
-class TestParseToolCalls:
-    def test_valid_json(self):
-        text = '[{"tool": "read_file", "args": {"path": "test.py"}}]'
-        calls = _parse_tool_calls(text)
-        assert len(calls) == 1
-        assert calls[0]["tool"] == "read_file"
-
-    def test_json_embedded_in_text(self):
-        text = 'Here is my plan:\n[{"tool": "done", "args": {"summary": "ok"}}]\nDone.'
-        calls = _parse_tool_calls(text)
-        assert calls[0]["tool"] == "done"
-
-    def test_invalid_json_becomes_done(self):
-        text = "I can't do that."
-        calls = _parse_tool_calls(text)
-        assert calls[0]["tool"] == "done"
-        assert "can't" in calls[0]["args"]["summary"]
-
-
 class TestRegistryDispatch:
     @pytest.fixture
     def workspace(self, tmp_path):
@@ -61,45 +43,110 @@ class TestRegistryDispatch:
         })
         return build_registry(workspace, cfg)
 
+    def _tc(self, name: str, args: dict) -> ToolCall:
+        """Helper to create a ToolCall."""
+        return ToolCall(id=f"test-{name}", name=name, arguments=args)
+
     def test_read_file(self, registry):
-        result = _execute_tool("read_file", {"path": "test.txt"}, registry, "auto")
+        tc = self._tc("read_file", {"path": "test.txt"})
+        result = _execute_tool(tc, registry, "auto")
         assert result["ok"]
-        assert "hello" in result.get("data", result).get("content", "")
+        assert "hello" in result.get("content", "")
 
     def test_write_file(self, registry, workspace):
-        result = _execute_tool("write_file", {"path": "new.py", "content": "x = 1\n"},
-                               registry, "auto")
+        tc = self._tc("write_file", {"path": "new.py", "content": "x = 1\n"})
+        result = _execute_tool(tc, registry, "auto")
         assert result["ok"]
         assert (workspace / "new.py").read_text() == "x = 1\n"
 
+    def test_replace_in_file(self, registry, workspace):
+        tc = self._tc("replace_in_file", {"path": "test.txt", "old_text": "hello", "new_text": "goodbye"})
+        result = _execute_tool(tc, registry, "auto")
+        assert result["ok"]
+        assert "goodbye" in (workspace / "test.txt").read_text()
+
     def test_list_files(self, registry):
-        result = _execute_tool("list_files", {}, registry, "auto")
+        tc = self._tc("list_files", {})
+        result = _execute_tool(tc, registry, "auto")
         assert result["ok"]
 
     def test_search(self, registry):
-        result = _execute_tool("search", {"pattern": "hello"}, registry, "auto")
+        tc = self._tc("search", {"pattern": "hello"})
+        result = _execute_tool(tc, registry, "auto")
         assert result["ok"]
 
     def test_run_command(self, registry):
-        result = _execute_tool("run_command", {"cmd": "echo test"}, registry, "auto")
+        tc = self._tc("run_command", {"command": "echo test"})
+        result = _execute_tool(tc, registry, "auto")
         assert result["ok"]
 
     def test_run_denied_command(self, registry):
-        result = _execute_tool("run_command", {"cmd": "rm -rf /"}, registry, "auto")
+        tc = self._tc("run_command", {"command": "rm -rf /"})
+        result = _execute_tool(tc, registry, "auto")
         assert not result["ok"]
 
     def test_done(self, registry):
-        result = _execute_tool("done", {"summary": "all good"}, registry, "auto")
+        tc = self._tc("done", {"summary": "all good"})
+        result = _execute_tool(tc, registry, "auto")
         assert result["ok"]
-        assert result.get("data", result).get("done") or result.get("done")
+        assert result.get("done") is True
 
     def test_unknown_tool(self, registry):
-        result = _execute_tool("nope", {}, registry, "auto")
+        tc = self._tc("nope", {})
+        result = _execute_tool(tc, registry, "auto")
         assert not result["ok"]
 
 
+class TestValidateDone:
+    def _tc_done(self, summary: str = "finished") -> ToolCall:
+        return ToolCall(id="done-1", name="done", arguments={"summary": summary})
+
+    def test_no_tests_run(self):
+        """done() should be rejected if no tests were run."""
+        err = _validate_done(self._tc_done(), [])
+        assert err is not None
+        assert "run tests" in err.lower()
+
+    def test_tests_failed(self):
+        """done() should be rejected if the most recent tests failed."""
+        history = [
+            {"tool": "run_tests", "result": {"ok": False, "failed": 2, "output": "FAILED test_a"}},
+        ]
+        err = _validate_done(self._tc_done(), history)
+        assert err is not None
+        assert "failing" in err.lower()
+
+    def test_tests_passed(self):
+        """done() should be accepted if the most recent tests passed."""
+        history = [
+            {"tool": "run_tests", "result": {"ok": True, "passed": 5, "failed": 0}},
+        ]
+        err = _validate_done(self._tc_done(), history)
+        assert err is None
+
+    def test_old_fail_then_pass(self):
+        """done() should look at most recent test, not earlier ones."""
+        history = [
+            {"tool": "run_tests", "result": {"ok": False, "failed": 1}},
+            {"tool": "replace_in_file", "result": {"ok": True}},
+            {"tool": "run_tests", "result": {"ok": True, "passed": 5, "failed": 0}},
+        ]
+        err = _validate_done(self._tc_done(), history)
+        assert err is None
+
+    def test_pass_then_fail(self):
+        """done() should reject if last test run failed even if earlier ones passed."""
+        history = [
+            {"tool": "run_tests", "result": {"ok": True, "passed": 5}},
+            {"tool": "replace_in_file", "result": {"ok": True}},
+            {"tool": "run_tests", "result": {"ok": False, "failed": 2}},
+        ]
+        err = _validate_done(self._tc_done(), history)
+        assert err is not None
+
+
 class TestBuildSystemPrompt:
-    def test_includes_actions(self, tmp_path):
+    def test_static_prompt_content(self, tmp_path):
         from mca.config import Config
         from mca.tools.registry import build_registry
         cfg = Config({
@@ -108,8 +155,62 @@ class TestBuildSystemPrompt:
         })
         registry = build_registry(tmp_path, cfg)
         prompt = _build_system_prompt(registry)
-        assert "read_file" in prompt
-        assert "write_file" in prompt
-        assert "run_command" in prompt
-        assert "done" in prompt
         assert "Maximus Code Agent" in prompt
+        assert "replace_in_file" in prompt
+        assert "run_tests" in prompt
+        assert "done" in prompt
+
+
+class TestToolDefinitions:
+    def test_registry_aggregates_definitions(self, tmp_path):
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": [], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        registry = build_registry(tmp_path, cfg)
+        defs = registry.tool_definitions()
+        names = [d["function"]["name"] for d in defs]
+        # Core actions present
+        assert "read_file" in names
+        assert "write_file" in names
+        assert "replace_in_file" in names
+        assert "run_command" in names
+        assert "done" in names
+        assert "run_tests" in names
+        assert "git_checkpoint" in names
+        # All have proper structure
+        for d in defs:
+            assert d["type"] == "function"
+            assert "name" in d["function"]
+            assert "parameters" in d["function"]
+            assert d["function"]["parameters"]["type"] == "object"
+
+    def test_definitions_have_descriptions(self, tmp_path):
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": [], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        registry = build_registry(tmp_path, cfg)
+        defs = registry.tool_definitions()
+        for d in defs:
+            assert d["function"].get("description"), f"{d['function']['name']} has no description"
+
+
+class TestBuildContext:
+    def test_build_context_with_files(self, tmp_path):
+        (tmp_path / "foo.py").write_text("x = 1")
+        (tmp_path / "bar.py").write_text("y = 2")
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": [], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        registry = build_registry(tmp_path, cfg)
+        ctx = _build_context(registry)
+        assert "foo.py" in ctx
+        assert "bar.py" in ctx

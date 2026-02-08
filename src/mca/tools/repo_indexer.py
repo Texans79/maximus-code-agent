@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 
 ENTRYPOINT_PATTERNS = [
     "main.py", "app.py", "index.py", "manage.py", "cli.py",
@@ -39,6 +39,25 @@ class RepoIndexer(ToolBase):
             "find_entrypoints": "Find main entrypoint files",
             "parse_dependencies": "Parse dependency manifests",
         }
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {"type": "function", "function": {
+                "name": "index_repo",
+                "description": "Full repo index: structure, entrypoints, and dependency manifests",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "find_entrypoints",
+                "description": "Find main entrypoint files (main.py, app.py, index.js, etc.)",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "parse_dependencies",
+                "description": "Parse dependency manifests (requirements.txt, package.json, pyproject.toml, go.mod)",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+        ]
 
     def _find_entrypoints(self) -> list[str]:
         found = []

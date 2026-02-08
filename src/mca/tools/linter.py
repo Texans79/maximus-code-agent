@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from mca.log import get_logger
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 from mca.tools.safe_shell import SafeShell
 
 log = get_logger("linter")
@@ -60,6 +60,31 @@ class LinterFormatter(ToolBase):
             "format_code": "Run detected formatters to auto-fix style",
             "detect_linters": "List which linters are available for this project",
         }
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {"type": "function", "function": {
+                "name": "lint",
+                "description": "Run detected linters and return issues found",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "linter": _param("string", "Specific linter to run (default: all detected)"),
+                    },
+                    "required": [],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "format_code",
+                "description": "Run detected formatters to auto-fix code style",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "detect_linters",
+                "description": "List which linters/formatters are available for this project",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+        ]
 
     def _detect_available(self) -> list[dict]:
         available = []

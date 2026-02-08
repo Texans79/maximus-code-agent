@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from mca.log import get_logger
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 from mca.tools.safe_shell import SafeShell
 
 log = get_logger("dep_doctor")
@@ -33,6 +33,30 @@ class DepDoctor(ToolBase):
             "check_node": "Check Node.js and installed modules",
             "check_go": "Check Go modules",
         }
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {"type": "function", "function": {
+                "name": "check_environment",
+                "description": "Full environment health check (Python, Node.js, Go)",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "check_python",
+                "description": "Check Python venv and installed packages",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "check_node",
+                "description": "Check Node.js and installed modules",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+            {"type": "function", "function": {
+                "name": "check_go",
+                "description": "Check Go modules",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+        ]
 
     def _check_python(self) -> dict[str, Any]:
         result: dict[str, Any] = {"detected": False}

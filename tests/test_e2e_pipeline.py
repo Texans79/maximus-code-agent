@@ -147,20 +147,28 @@ version = "0.1.0"
         embedder.close()
         store.close()
 
-    def test_dynamic_system_prompt(self, demo_repo):
-        """Verify dynamic prompt includes all tool actions."""
+    def test_tool_definitions_and_prompt(self, demo_repo):
+        """Verify tool definitions aggregate correctly and prompt is valid."""
         from mca.config import load_config
         from mca.tools.registry import build_registry
         from mca.orchestrator.loop import _build_system_prompt
 
         cfg = load_config(str(demo_repo))
         registry = build_registry(demo_repo, cfg)
-        prompt = _build_system_prompt(registry)
 
-        # Should list all registered actions
-        assert "read_file" in prompt
-        assert "write_file" in prompt
-        assert "run_command" in prompt
+        # Tool definitions should include all actions
+        defs = registry.tool_definitions()
+        names = [d["function"]["name"] for d in defs]
+        assert "read_file" in names
+        assert "write_file" in names
+        assert "run_command" in names
+        assert "done" in names
+        assert "git_checkpoint" in names
+        assert "run_tests" in names
+        assert "replace_in_file" in names
+        assert len(defs) >= 25  # 26 without memory, 28 with
+
+        # System prompt should have core rules
+        prompt = _build_system_prompt(registry)
+        assert "Maximus Code Agent" in prompt
         assert "done" in prompt
-        assert "git_checkpoint" in prompt
-        assert "run_tests" in prompt

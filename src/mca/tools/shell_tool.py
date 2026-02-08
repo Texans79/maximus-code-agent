@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 from mca.tools.safe_shell import SafeShell
 from mca.utils.secrets import redact
 
@@ -22,6 +22,19 @@ class ShellTool(ToolBase):
 
     def actions(self) -> dict[str, str]:
         return {"run_command": "Execute a shell command in the workspace"}
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [{"type": "function", "function": {
+            "name": "run_command",
+            "description": "Execute a shell command in the workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": _param("string", "Shell command to execute"),
+                },
+                "required": ["command"],
+            },
+        }}]
 
     def execute(self, action: str, args: dict[str, Any]) -> ToolResult:
         if action != "run_command":

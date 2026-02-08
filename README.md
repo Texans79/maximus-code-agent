@@ -1,27 +1,45 @@
 # Maximus Code Agent (MCA)
 
-A local-first AI coding agent with safety rails, multi-agent review pipeline, and hardware-aware telemetry.
+A local-first AI coding agent with structured function calling, safety rails, multi-agent review pipeline, and hardware-aware telemetry. Runs entirely on your own hardware via vLLM.
 
 ## Features
 
+- **Structured Function Calling**: 26 tool definitions with JSON Schema, passed to the LLM via the `tools` parameter. No more hoping the model outputs valid JSON.
 - **Workspace Jail**: All file operations confined to a configured workspace. Blocks traversal, symlinks, and absolute paths outside it.
-- **Diff-Only Edits**: File modifications applied as unified diffs (patches). No blind full rewrites.
+- **Search & Replace Editing**: `replace_in_file` for reliable exact-text edits; `edit_file` for unified diffs. No blind full rewrites.
 - **Shell Safety**: Denylist for dangerous commands (`rm -rf /`, `mkfs`, `dd`, `curl|bash`, etc.). Allowlist option. Full command logging.
+- **Done Validation**: The agent cannot call `done()` unless tests have actually passed. Prevents hallucinated success.
 - **Approval Modes**: `auto` / `ask` / `paranoid` — control exactly what the agent can do.
 - **Git Checkpoints**: Every task creates a checkpoint commit; on failure, automatic rollback. `mca rollback` to undo.
-- **Verification Loop**: Plan → Edit → Run → Fix → Run. Iterates until tests pass.
 - **Secret Redaction**: Env values and tokens are never printed in logs.
 - **Multi-Agent Pipeline**: Planner → Implementer → Reviewer → Tester chain. Reviewer blocks if tests are missing.
 - **Hardware Telemetry**: CPU, RAM, Disk, GPU (nvidia-smi), NVMe temps via `mca status`.
-- **Long-Term Memory**: SQLite (default) or Postgres+pgvector. Store project decisions, recipes, embeddings.
-- **Project Templates**: `python-cli`, `fastapi`, `node-ts`, `docker-service`.
-- **Telegram Control**: `/run`, `/status`, `/rollback`, `/logs`, `/approve`, `/deny`.
+- **Long-Term Memory**: PostgreSQL + pgvector (primary) with SQLite fallback. Store project decisions, recipes, embeddings.
+- **Memory Recall**: Before each task, MCA searches past work for similar context and injects it into the prompt.
+- **Token Tracking**: Cumulative prompt/completion token counting across all LLM calls.
+- **Streaming**: `chat_stream()` for real-time token output.
+- **Telegram Bot**: `/run`, `/status`, `/memory`, `/rollback`, `/logs` — control MCA from your phone.
+
+## Tools (26 actions across 10 tools)
+
+| Tool | Actions | Description |
+|------|---------|-------------|
+| **filesystem** | read_file, write_file, replace_in_file, edit_file, search, list_files | Workspace-jailed file operations |
+| **shell** | run_command | Execute commands with safety denylist |
+| **git** | git_checkpoint, git_rollback, git_branch, git_diff, git_log | Version control with auto-checkpoint |
+| **done** | done | Signal task completion (validated) |
+| **telemetry** | system_status | CPU/RAM/GPU/NVMe telemetry |
+| **memory** | memory_add, memory_search | Long-term knowledge store |
+| **test_runner** | run_tests, detect_test_framework | Auto-detect and run pytest/jest/go/cargo |
+| **repo_indexer** | index_repo, find_entrypoints, parse_dependencies | Map repo structure |
+| **linter** | lint, format_code, detect_linters | Run ruff/eslint/prettier |
+| **dep_doctor** | check_environment, check_python, check_node, check_go | Verify environment health |
 
 ## Install
 
 ```bash
 # Clone
-git clone <repo-url> && cd maximus-code-agent
+git clone https://github.com/Texans79/maximus-code-agent.git && cd maximus-code-agent
 
 # Create env (Python 3.11+)
 python -m venv .venv && source .venv/bin/activate
@@ -56,38 +74,43 @@ mca run "Refactor the database module" --mode paranoid
 mca status
 ```
 
-Output:
-```
-┌────────────────────────────────┐
-│        System Status           │
-├──────────────┬─────────────────┤
-│ CPU          │ AMD Threadripper│
-│   Load (1m)  │        12.3%   │
-│ RAM          │ 48/512 GB (9%) │
-│ GPU 0        │ RTX 6000 Ada   │
-│   Temp       │          45°C  │
-│   Util       │           23%  │
-│   VRAM       │ 12000/49140 MB │
-└──────────────┴─────────────────┘
-```
-
-### Scaffold a new project
+### LLM connectivity
 
 ```bash
-mca init --template python-cli --name my-tool
-mca init --template fastapi --name my-api
-mca init --template node-ts --name my-app
-mca init --template docker-service --name my-svc
+mca llm ping
+# → Qwen/Qwen2.5-72B-Instruct-AWQ @ http://localhost:8000/v1
+
+mca embed "test embedding"
+# → 768 dimensions
+```
+
+### Tools
+
+```bash
+mca tools list
+# → 10 tools, 26 actions
+
+mca tools verify
+# → All 10 tools OK
 ```
 
 ### Memory
 
 ```bash
-# Store a decision
+# Store a decision (auto-embeds via Ollama)
 mca memory add "Use SQLite for local storage, Postgres for production" --tags "architecture,database"
 
 # Search
 mca memory search "database storage"
+
+# Recall similar past work
+mca memory recall "fix login bug"
+```
+
+### Run tests
+
+```bash
+mca test --workspace ./my-project
 ```
 
 ### Rollback
@@ -103,7 +126,7 @@ export MCA_TELEGRAM_TOKEN="your-bot-token"
 mca telegram start
 ```
 
-Bot commands: `/status`, `/run <task>`, `/rollback`, `/logs`, `/approve`, `/deny`
+Bot commands: `/status`, `/run <task>`, `/memory <query>`, `/rollback`, `/logs`
 
 ## Configuration
 
@@ -131,9 +154,8 @@ git:
   auto_checkpoint: true
 
 memory:
-  backend: sqlite  # or postgres
-  sqlite_path: ".mca/memory.db"
-  postgres_dsn: "postgresql://user:pass@localhost/mca"
+  backend: postgres  # or sqlite
+  postgres_dsn: "postgresql://maximus_user@localhost:5432/openwebui"
 
 style:
   indent: 4
@@ -142,14 +164,22 @@ style:
 ```
 
 Environment variable overrides:
-- `MCA_WORKSPACE` — workspace directory
-- `MCA_APPROVAL_MODE` — approval mode
-- `MCA_LLM_BASE_URL` — LLM endpoint
-- `MCA_LLM_MODEL` — model name
-- `MCA_LLM_API_KEY` — API key
+- `VLLM_BASE_URL` — LLM endpoint (default: `http://localhost:8000/v1`)
+- `VLLM_MODEL` — model name
+- `VLLM_API_KEY` — API key
+- `EMBEDDING_BASE_URL` — Ollama endpoint (default: `http://localhost:11434`)
+- `EMBEDDING_MODEL` — embedding model (default: `nomic-embed-text`)
 - `MCA_TELEGRAM_TOKEN` — Telegram bot token
 
 ## Safety
+
+### Done validation
+
+The agent cannot call `done()` to signal task completion unless:
+1. Tests have been run (at least one `run_tests` call)
+2. The most recent test run passed (exit code 0)
+
+If the LLM tries to call `done()` without passing tests, the call is rejected and the agent is told to fix the issues first.
 
 ### What's blocked by default
 
@@ -184,45 +214,64 @@ Environment variable overrides:
 
 ```
 src/mca/
-├── cli.py              # Typer CLI commands
+├── cli.py              # Typer CLI (run, status, tools, llm, memory, embed, test)
 ├── config.py           # YAML + env config loader
 ├── log.py              # Structured JSON + console logging
 ├── tools/
-│   ├── safe_fs.py      # Workspace jail + diff/patch
-│   ├── safe_shell.py   # Command denylist + logging
-│   └── git_ops.py      # Checkpoints + rollback
+│   ├── base.py         # ToolBase ABC, ToolResult, _param helper
+│   ├── registry.py     # ToolRegistry + build_registry() factory
+│   ├── fs_tool.py      # FSTool — workspace-jailed file I/O (6 actions)
+│   ├── safe_fs.py      # SafeFS — jail, search, diff, replace_in_file
+│   ├── shell_tool.py   # ShellTool — command execution
+│   ├── safe_shell.py   # SafeShell — denylist, timeout, logging
+│   ├── git_tool.py     # GitTool — checkpoint, rollback, branch, diff, log
+│   ├── git_ops.py      # GitOps — git subprocess wrappers
+│   ├── done_tool.py    # DoneTool — task completion signal
+│   ├── telemetry_tool.py # TelemetryTool — system metrics
+│   ├── memory_tool.py  # MemoryTool — knowledge store access
+│   ├── test_runner.py  # TestRunner — detect & run pytest/jest/go/cargo
+│   ├── repo_indexer.py # RepoIndexer — entrypoints, deps, file types
+│   ├── linter.py       # LinterFormatter — ruff, eslint, prettier
+│   └── dep_doctor.py   # DepDoctor — Python/Node/Go env health
+├── llm/
+│   ├── __init__.py
+│   └── client.py       # LLMClient — vLLM chat + streaming + token tracking
 ├── orchestrator/
-│   ├── loop.py         # Plan→edit→run→fix loop
+│   ├── loop.py         # Main loop: function calling, tool dispatch, validation
 │   ├── approval.py     # Auto/ask/paranoid modes
-│   └── agents.py       # Multi-agent pipeline
-├── telemetry/
-│   └── collectors.py   # CPU/RAM/GPU/NVMe
+│   └── agents.py       # Multi-agent pipeline (Planner/Implementer/Reviewer/Tester)
 ├── memory/
-│   ├── base.py         # Store interface + factory
-│   ├── sqlite_store.py # SQLite + FTS5
-│   └── pg_store.py     # Postgres + pgvector
+│   ├── base.py         # MemoryStore interface + factory
+│   ├── sqlite_store.py # SQLite + FTS5 fallback
+│   ├── pg_store.py     # PostgreSQL + pgvector (primary)
+│   ├── migrations.py   # Schema migrations (3 versions)
+│   ├── embeddings.py   # Embedder — Ollama nomic-embed-text (768-dim)
+│   └── recall.py       # recall_similar() + store_outcome()
+├── telemetry/
+│   └── collectors.py   # CPU/RAM/GPU/NVMe data collection
 ├── templates/
-│   └── registry.py     # Project scaffolding
-└── telegram/
-    └── bot.py          # Telegram bot
+│   └── registry.py     # Project scaffolding (python-cli, fastapi, etc.)
+├── telegram/
+│   └── bot.py          # Telegram bot (async, non-blocking task execution)
+└── utils/
+    └── secrets.py      # Secret redaction patterns
 ```
 
 ## Testing
 
 ```bash
-# Run all tests
-pytest -v
+# Run all tests (187 tests)
+PGPASSWORD=Arianna1 pytest tests/ -v
 
 # Run specific test module
 pytest tests/test_safe_fs.py -v
+pytest tests/test_orchestrator.py -v
+pytest tests/test_llm_client.py -v
 ```
 
 ## Demo
 
 ```bash
-# Run demo tests
-cd demo_repo && python -m pytest tests/ -v && cd ..
-
 # Use MCA on the demo repo
 mca run "Add a power(base, exp) function to app.py with tests" \
     --workspace ./demo_repo --mode auto

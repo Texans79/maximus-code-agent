@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from mca.log import get_logger
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 from mca.tools.safe_shell import SafeShell
 
 log = get_logger("test_runner")
@@ -76,6 +76,27 @@ class TestRunner(ToolBase):
             "run_tests": "Run the project test suite (auto-detects framework)",
             "detect_test_framework": "Detect which test framework the project uses",
         }
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {"type": "function", "function": {
+                "name": "run_tests",
+                "description": "Run the project test suite (auto-detects framework: pytest, jest, go test, cargo test)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": _param("string", "Override test command (default: auto-detected)"),
+                        "path": _param("string", "Specific test file or directory to run"),
+                    },
+                    "required": [],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "detect_test_framework",
+                "description": "Detect which test framework the project uses",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            }},
+        ]
 
     def _pytest_cmd(self) -> str:
         return f"{self._python} -m pytest --tb=short -q"

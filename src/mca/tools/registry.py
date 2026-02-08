@@ -46,6 +46,13 @@ class ToolRegistry:
             out.update(tool.actions())
         return out
 
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        """Aggregate OpenAI-format tool definitions from all registered tools."""
+        defs: list[dict[str, Any]] = []
+        for tool in self._tools.values():
+            defs.extend(tool.tool_definitions())
+        return defs
+
     def verify_all(self) -> dict[str, ToolResult]:
         return {name: tool.verify() for name, tool in self._tools.items()}
 

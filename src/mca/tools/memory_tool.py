@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from mca.memory.base import MemoryStore
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 
 
 class MemoryTool(ToolBase):
@@ -24,6 +24,35 @@ class MemoryTool(ToolBase):
             "memory_add": "Store a knowledge entry",
             "memory_search": "Search stored knowledge by text query",
         }
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {"type": "function", "function": {
+                "name": "memory_add",
+                "description": "Store a knowledge entry in long-term memory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": _param("string", "Text content to store"),
+                        "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
+                        "category": _param("string", "Category (default: general)"),
+                    },
+                    "required": ["content"],
+                },
+            }},
+            {"type": "function", "function": {
+                "name": "memory_search",
+                "description": "Search stored knowledge by text query",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": _param("string", "Search query text"),
+                        "limit": _param("integer", "Max results to return (default: 5)"),
+                    },
+                    "required": ["query"],
+                },
+            }},
+        ]
 
     def execute(self, action: str, args: dict[str, Any]) -> ToolResult:
         if action == "memory_add":

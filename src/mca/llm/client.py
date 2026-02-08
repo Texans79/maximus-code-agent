@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +75,9 @@ class LLMClient:
         )
         self.timeout = timeout
         self.max_retries = max_retries
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
+        self._total_requests = 0
         self._client = httpx.Client(
             base_url=self.base_url,
             headers={
@@ -109,7 +113,9 @@ class LLMClient:
                 resp = self._client.post("/chat/completions", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-                return self._parse_response(data)
+                result = self._parse_response(data)
+                self._track_usage(result.usage)
+                return result
 
             except httpx.TimeoutException as e:
                 last_err = e
@@ -133,6 +139,67 @@ class LLMClient:
                 time.sleep(delay)
 
         raise LLMError(f"LLM request failed after {self.max_retries} attempts: {last_err}")
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+    ) -> Iterator[str]:
+        """Stream chat completion, yielding content chunks as they arrive.
+
+        Does NOT support tool call parsing (use chat() for tool calling).
+        Tracks token usage from the final chunk's usage field if provided.
+        """
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+
+        resp = self._client.post("/chat/completions", json=payload)
+        resp.raise_for_status()
+
+        self._total_requests += 1
+        for line in resp.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    yield content
+                # Track usage from final chunk (vLLM includes it)
+                usage = chunk.get("usage")
+                if usage:
+                    self._track_usage(usage)
+            except json.JSONDecodeError:
+                continue
+
+    def _track_usage(self, usage: dict[str, int]) -> None:
+        """Accumulate token usage across calls."""
+        self._total_prompt_tokens += usage.get("prompt_tokens", 0)
+        self._total_completion_tokens += usage.get("completion_tokens", 0)
+        self._total_requests += 1
+
+    @property
+    def token_usage(self) -> dict[str, int]:
+        """Return cumulative token usage for this client's lifetime."""
+        return {
+            "prompt_tokens": self._total_prompt_tokens,
+            "completion_tokens": self._total_completion_tokens,
+            "total_tokens": self._total_prompt_tokens + self._total_completion_tokens,
+            "requests": self._total_requests,
+        }
 
     def ping(self) -> dict[str, Any]:
         """Verify the LLM endpoint is reachable. Returns model info."""

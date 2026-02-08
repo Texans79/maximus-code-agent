@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mca.tools.base import ToolBase, ToolResult
+from mca.tools.base import ToolBase, ToolResult, _param
 
 
 class TelemetryTool(ToolBase):
@@ -17,6 +17,13 @@ class TelemetryTool(ToolBase):
 
     def actions(self) -> dict[str, str]:
         return {"system_status": "Collect CPU/RAM/disk/GPU/NVMe telemetry data"}
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [{"type": "function", "function": {
+            "name": "system_status",
+            "description": "Collect CPU/RAM/disk/GPU/NVMe telemetry data",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        }}]
 
     def execute(self, action: str, args: dict[str, Any]) -> ToolResult:
         if action != "system_status":

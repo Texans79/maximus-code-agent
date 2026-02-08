@@ -201,6 +201,25 @@ class SafeFS:
         log.info("manual patch applied to %s", target)
         return True
 
+    def replace_in_file(self, rel_path: str, old_text: str, new_text: str) -> bool:
+        """Replace exact text in a file. More reliable than diff/patch.
+
+        Returns True if replacement was made, False if old_text not found.
+        Only replaces the first occurrence.
+        """
+        target = self._jail(rel_path)
+        if not target.exists():
+            log.warning("replace_in_file: file not found: %s", rel_path)
+            return False
+        content = target.read_text(encoding="utf-8", errors="replace")
+        if old_text not in content:
+            log.warning("replace_in_file: old_text not found in %s", rel_path)
+            return False
+        new_content = content.replace(old_text, new_text, 1)
+        target.write_text(new_content, encoding="utf-8")
+        log.info("replaced text in %s (%d→%d chars)", rel_path, len(old_text), len(new_text))
+        return True
+
     def mkdir(self, rel_path: str) -> Path:
         target = self._jail(rel_path)
         target.mkdir(parents=True, exist_ok=True)

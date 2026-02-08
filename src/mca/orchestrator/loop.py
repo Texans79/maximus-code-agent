@@ -1,6 +1,7 @@
-"""Orchestrator loop: plan → implement → review → test.
+"""Orchestrator loop: structured function calling with validation.
 
-Uses ToolRegistry for dispatch, LLMClient for inference, and PostgreSQL
+Uses ToolRegistry for dispatch (with JSON Schema tool definitions),
+LLMClient for inference with the `tools` parameter, and PostgreSQL
 for task/step/artifact tracking.
 """
 from __future__ import annotations
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from mca.config import Config
-from mca.llm.client import LLMClient, LLMResponse, get_client
+from mca.llm.client import LLMClient, LLMResponse, ToolCall, get_client
 from mca.log import console, get_logger
 from mca.orchestrator.approval import ApprovalDenied, approve_command, approve_diff, approve_plan
 from mca.tools.base import ToolResult
@@ -22,95 +23,58 @@ from mca.utils.secrets import redact
 
 log = get_logger("orchestrator")
 
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 15
 
 
 def _build_system_prompt(registry: ToolRegistry) -> str:
-    """Build dynamic system prompt from registered tools."""
-    actions = registry.list_actions()
-    tool_desc = "\n".join(f"- {name}: {desc}" for name, desc in actions.items())
-    return f"""\
+    """Build dynamic system prompt — tools are passed structurally, not in text."""
+    return """\
 You are Maximus Code Agent (MCA), an expert AI coding assistant.
-You operate on a workspace directory. Available actions:
-
-{tool_desc}
+You operate on a workspace directory using the tools provided.
 
 RULES:
-- ALWAYS prefer edit_file with diffs over write_file for existing files.
+- For editing existing files, prefer replace_in_file (exact text match) over edit_file (diff).
 - For new files, use write_file.
-- After code changes, run tests to verify. If tests fail, fix and retry.
-- Generate minimal tests if none exist.
-- Be concise. Explain what you change and why.
+- After code changes, ALWAYS run_tests to verify. If tests fail, fix and retry.
+- If no tests exist, create minimal tests before calling done.
+- Be precise — match the existing code style.
 - Never leak secrets or environment variables.
-- Call done(summary) when the task is complete.
-
-Respond with a JSON array of tool calls:
-[{{"tool": "action_name", "args": {{"key": "value"}}}}]
-
-Only respond with the JSON array, no other text."""
+- Call done(summary) ONLY when you have verified changes work (tests pass).
+- If tests fail, do NOT call done. Fix the issue and retry."""
 
 
-def _build_context(fs: SafeFS) -> str:
-    """Build repo context for the LLM."""
-    tree = fs.tree(max_depth=3)
-    tree_str = "\n".join(f"  {f}" for f in tree[:100])
-    if len(tree) > 100:
-        tree_str += f"\n  … and {len(tree) - 100} more files"
-    return f"Workspace files:\n{tree_str}"
-
-
-def _call_llm(client: LLMClient, messages: list[dict], config: Config) -> str:
-    """Call the LLM and return the assistant message content."""
-    try:
-        resp = client.chat(
-            messages=messages,
-            temperature=config.llm.temperature,
-            max_tokens=config.llm.max_tokens,
-        )
-        return resp.content or ""
-    except Exception as e:
-        log.error("LLM call failed: %s", e)
-        return json.dumps([{"tool": "done", "args": {"summary": f"LLM error: {e}"}}])
-
-
-def _parse_tool_calls(text: str) -> list[dict]:
-    """Extract tool calls from LLM response."""
-    text = text.strip()
-    # Try to find JSON array in the response
-    if not text.startswith("["):
-        start = text.find("[")
-        end = text.rfind("]")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
-        else:
-            return [{"tool": "done", "args": {"summary": text}}]
-    try:
-        calls = json.loads(text)
-        if isinstance(calls, list):
-            return calls
-        return [calls]
-    except json.JSONDecodeError:
-        log.warning("Failed to parse LLM response as JSON")
-        return [{"tool": "done", "args": {"summary": text}}]
+def _build_context(registry: ToolRegistry) -> str:
+    """Build repo context from the filesystem tool."""
+    fs_tool = registry.get_tool("filesystem")
+    if not fs_tool:
+        return ""
+    result = fs_tool.execute("list_files", {})
+    if not result.ok:
+        return ""
+    files = result.data.get("files", [])
+    tree = "\n".join(f"  {f}" for f in files[:100])
+    if len(files) > 100:
+        tree += f"\n  … and {len(files) - 100} more files"
+    return f"Workspace files:\n{tree}"
 
 
 def _execute_tool(
-    tool: str,
-    args: dict,
+    tc: ToolCall,
     registry: ToolRegistry,
     approval_mode: str,
 ) -> dict[str, Any]:
-    """Execute a tool call via the registry with approval checks."""
+    """Execute a single tool call via the registry with approval checks."""
     try:
         # Approval checks for write/command actions
-        if tool == "write_file" and approval_mode != "auto":
-            approve_diff(args.get("path", "?"), "(new file)", approval_mode)
-        elif tool == "edit_file" and approval_mode != "auto":
-            approve_diff(args.get("path", "?"), args.get("diff", ""), approval_mode)
-        elif tool == "run_command" and approval_mode != "auto":
-            approve_command(args.get("cmd", ""), approval_mode)
+        if tc.name == "write_file" and approval_mode != "auto":
+            approve_diff(tc.arguments.get("path", "?"), "(new file)", approval_mode)
+        elif tc.name in ("edit_file", "replace_in_file") and approval_mode != "auto":
+            old = tc.arguments.get("old_text", tc.arguments.get("diff", ""))
+            approve_diff(tc.arguments.get("path", "?"), old, approval_mode)
+        elif tc.name == "run_command" and approval_mode != "auto":
+            approve_command(tc.arguments.get("command", tc.arguments.get("cmd", "")), approval_mode)
 
-        result = registry.dispatch(tool, args)
+        result = registry.dispatch(tc.name, tc.arguments)
         return result.to_dict()
 
     except ApprovalDenied as e:
@@ -121,6 +85,32 @@ def _execute_tool(
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def _validate_done(tc: ToolCall, tool_history: list[dict]) -> str | None:
+    """Validate that done() is legitimate — tests must have passed.
+
+    Returns None if valid, or an error message string if invalid.
+    """
+    # Look for the most recent test run in tool_history
+    last_test = None
+    for entry in reversed(tool_history):
+        if entry.get("tool") == "run_tests":
+            last_test = entry.get("result", {})
+            break
+
+    if last_test is None:
+        return "You must run tests before calling done. Call run_tests first."
+
+    if not last_test.get("ok", False):
+        failed = last_test.get("failed", "?")
+        output = last_test.get("output", "")[:500]
+        return (
+            f"Tests are failing ({failed} failed). Fix the issues before calling done.\n"
+            f"Test output: {output}"
+        )
+
+    return None  # Valid
+
+
 def run_task(
     task: str,
     workspace: Path,
@@ -129,8 +119,9 @@ def run_task(
 ) -> dict[str, Any]:
     """Run the full orchestrator loop for a task.
 
-    Builds the tool registry, connects to LLM, creates a Postgres task
-    record, and iterates until done or max iterations.
+    Uses structured function calling: passes tool JSON schemas to the LLM
+    via the `tools` parameter, parses ToolCall objects from the response,
+    and sends results back as tool-role messages.
     """
     log.info("Starting task: %s", task)
     log.info("Workspace: %s, Mode: %s", workspace, approval_mode)
@@ -150,6 +141,7 @@ def run_task(
     # ── Build registry ───────────────────────────────────────────────────
     registry = build_registry(workspace, config, memory_store=store)
     system_prompt = _build_system_prompt(registry)
+    tool_defs = registry.tool_definitions()
 
     # ── Git checkpoint ───────────────────────────────────────────────────
     git_tool = registry.get_tool("git")
@@ -184,13 +176,7 @@ def run_task(
         log.debug("Memory recall skipped: %s", e)
 
     # ── Build initial messages ───────────────────────────────────────────
-    fs_tool = registry.get_tool("filesystem")
-    context = ""
-    if fs_tool:
-        ctx_result = fs_tool.execute("list_files", {})
-        if ctx_result.ok:
-            files = ctx_result.data.get("files", [])
-            context = "Workspace files:\n" + "\n".join(f"  {f}" for f in files[:100])
+    context = _build_context(registry)
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
@@ -200,26 +186,29 @@ def run_task(
     # ── Plan approval ────────────────────────────────────────────────────
     if approval_mode in ("ask", "paranoid"):
         console.print("[info]Generating plan…[/info]")
-        plan_response = _call_llm(client, messages, config)
+        plan_resp = client.chat(
+            messages=messages,
+            temperature=config.llm.temperature,
+            max_tokens=config.llm.max_tokens,
+        )
+        plan_text = plan_resp.content or "(no plan text)"
         try:
-            approve_plan(f"Task: {task}\n\nLLM proposed actions:\n{plan_response[:2000]}", approval_mode)
+            approve_plan(f"Task: {task}\n\nPlan:\n{plan_text[:2000]}", approval_mode)
         except ApprovalDenied:
             if checkpoint_tag and git_tool:
                 git_tool.execute("git_rollback", {})
             _finalize_task(store, task_id, False, "Plan rejected by user")
             client.close()
             return {"success": False, "error": "Plan rejected by user"}
-        messages.append({"role": "assistant", "content": plan_response})
-    else:
-        plan_response = _call_llm(client, messages, config)
-        messages.append({"role": "assistant", "content": plan_response})
+        messages.append({"role": "assistant", "content": plan_text})
+        messages.append({"role": "user", "content": "Approved. Proceed with the implementation using tool calls."})
 
     # ── Record plan step ─────────────────────────────────────────────────
     if store and task_id:
         try:
             step_id = store.add_step(task_id, "plan", agent_role="planner")
             store.update_step(step_id, status="completed",
-                              output={"plan": plan_response[:2000]})
+                              output={"plan": messages[-1]["content"][:2000] if messages else ""})
         except Exception:
             pass
 
@@ -227,52 +216,116 @@ def run_task(
     last_summary = ""
     success = False
     iteration = 0
+    tool_history: list[dict] = []  # Track all tool calls + results
 
     for iteration in range(MAX_ITERATIONS):
         console.print(f"\n[bold cyan]── Iteration {iteration + 1}/{MAX_ITERATIONS} ──[/bold cyan]")
 
-        last_content = messages[-1]["content"] if messages[-1]["role"] == "assistant" else plan_response
-        tool_calls = _parse_tool_calls(last_content)
+        # ── Call LLM with structured tools ────────────────────────────────
+        resp = client.chat(
+            messages=messages,
+            tools=tool_defs,
+            temperature=config.llm.temperature,
+            max_tokens=config.llm.max_tokens,
+        )
 
-        results: list[dict] = []
+        # ── Handle pure text response (no tool calls) ─────────────────────
+        if not resp.tool_calls:
+            content = resp.content or ""
+            if content:
+                console.print(f"[dim]{content[:300]}[/dim]")
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": "Please use the available tools to complete the task."})
+            else:
+                console.print("[warn]LLM returned empty response[/warn]")
+                messages.append({"role": "assistant", "content": ""})
+                messages.append({"role": "user", "content": "No response received. Please use the available tools."})
+            continue
+
+        # ── Build assistant message with tool_calls ───────────────────────
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": resp.content or ""}
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": json.dumps(tc.arguments),
+                },
+            }
+            for tc in resp.tool_calls
+        ]
+        messages.append(assistant_msg)
+
+        # ── Execute each tool call ────────────────────────────────────────
         done = False
-        for tc in tool_calls:
-            tool_name = tc.get("tool", "")
-            tool_args = tc.get("args", {})
-            console.print(f"  [bold]→ {tool_name}[/bold]"
-                          f"({', '.join(f'{k}={v!r}' for k, v in list(tool_args.items())[:3])})")
+        for tc in resp.tool_calls:
+            console.print(
+                f"  [bold]→ {tc.name}[/bold]"
+                f"({', '.join(f'{k}={v!r}' for k, v in list(tc.arguments.items())[:3])})"
+            )
 
-            result = _execute_tool(tool_name, tool_args, registry, approval_mode)
-            results.append({"tool": tool_name, "result": result})
+            # ── Validate done() before executing ──────────────────────────
+            if tc.name == "done":
+                validation_err = _validate_done(tc, tool_history)
+                if validation_err:
+                    console.print(f"  [warn]Done rejected: {validation_err[:100]}[/warn]")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps({"ok": False, "error": validation_err}),
+                    })
+                    # Log the rejected done
+                    if store and task_id:
+                        try:
+                            store.log_tool(task_id, "done", command="REJECTED", exit_code=1)
+                        except Exception:
+                            pass
+                    continue
+                # Valid done
+                result = _execute_tool(tc, registry, approval_mode)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(result, default=str),
+                })
+                done = True
+                last_summary = tc.arguments.get("summary", "")
+                break
+
+            # ── Execute the tool ──────────────────────────────────────────
+            result = _execute_tool(tc, registry, approval_mode)
+            tool_history.append({"tool": tc.name, "args": tc.arguments, "result": result})
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, default=str),
+            })
 
             # Log tool execution
             if store and task_id:
                 try:
-                    store.log_tool(task_id, tool_name,
-                                   command=json.dumps(tool_args)[:500],
+                    store.log_tool(task_id, tc.name,
+                                   command=json.dumps(tc.arguments)[:500],
                                    exit_code=0 if result.get("ok") else 1)
                 except Exception:
                     pass
 
-            if result.get("done"):
-                done = True
-                last_summary = result.get("summary", "")
-                break
+            # Print compact result
+            if result.get("ok"):
+                console.print(f"    [green]OK[/green]")
+            else:
+                err = result.get("error", "unknown error")
+                console.print(f"    [red]FAIL: {err[:100]}[/red]")
 
         if done:
             success = True
             break
 
-        feedback = json.dumps(results, indent=2, default=str)
-        messages.append({"role": "user", "content": f"Tool results:\n{feedback}"})
-
-        console.print("[dim]  Thinking…[/dim]")
-        next_response = _call_llm(client, messages, config)
-        messages.append({"role": "assistant", "content": next_response})
-
     # ── Finalize ─────────────────────────────────────────────────────────
     if success:
-        console.print(f"\n[success]Summary: {last_summary}[/success]")
+        console.print(f"\n[bold green]✓ Task complete: {last_summary}[/bold green]")
         if checkpoint_tag and git_tool:
             git_tool.execute("git_checkpoint", {"message": f"MCA done: {task[:60]}"})
 
@@ -285,7 +338,7 @@ def run_task(
             if git_tool:
                 diff_result = git_tool.execute("git_diff", {})
                 if diff_result.ok:
-                    diff = diff_result.data.get("diff", "")
+                    diff = diff_result.data.get("diff_stat", "")
             store_outcome(store, embedder, task_id or "unknown", last_summary,
                           outcome="completed", diff=diff, project=str(workspace))
             embedder.close()
@@ -293,7 +346,7 @@ def run_task(
             log.debug("Outcome storage skipped: %s", e)
 
     else:
-        console.print("[error]Max iterations reached without completion.[/error]")
+        console.print("[bold red]✗ Max iterations reached without completion.[/bold red]")
         if checkpoint_tag and git_tool:
             console.print("[warn]Rolling back…[/warn]")
             git_tool.execute("git_rollback", {})
@@ -306,6 +359,7 @@ def run_task(
         "summary": last_summary,
         "iterations": iteration + 1,
         "task_id": task_id,
+        "tool_calls_made": len(tool_history),
     }
 
 
