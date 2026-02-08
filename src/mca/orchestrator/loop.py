@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,7 @@ def run_task(
     via the `tools` parameter, parses ToolCall objects from the response,
     and sends results back as tool-role messages.
     """
+    started_at = datetime.now(timezone.utc)
     log.info("Starting task: %s", task)
     log.info("Workspace: %s, Mode: %s", workspace, approval_mode)
 
@@ -198,6 +200,11 @@ def run_task(
             if checkpoint_tag and git_tool:
                 git_tool.execute("git_rollback", {})
             _finalize_task(store, task_id, False, "Plan rejected by user")
+            _write_run_metrics(store, task_id=task_id, started_at=started_at,
+                               success=False, iterations=0, tool_calls=0,
+                               files_changed=0, tests_runs=0, lint_runs=0,
+                               rollback_used=bool(checkpoint_tag), failure_reason="Plan rejected by user",
+                               model=config.llm.model, client=client)
             client.close()
             return {"success": False, "error": "Plan rejected by user"}
         messages.append({"role": "assistant", "content": plan_text})
@@ -217,6 +224,11 @@ def run_task(
     success = False
     iteration = 0
     tool_history: list[dict] = []  # Track all tool calls + results
+    tests_runs = 0
+    lint_runs = 0
+    files_changed = 0
+    rollback_used = False
+    failure_reason = ""
 
     for iteration in range(MAX_ITERATIONS):
         console.print(f"\n[bold cyan]── Iteration {iteration + 1}/{MAX_ITERATIONS} ──[/bold cyan]")
@@ -297,6 +309,15 @@ def run_task(
             result = _execute_tool(tc, registry, approval_mode)
             tool_history.append({"tool": tc.name, "args": tc.arguments, "result": result})
 
+            # ── Metric counters ───────────────────────────────────────
+            if tc.name == "run_tests":
+                tests_runs += 1
+            elif tc.name in ("lint", "format_code"):
+                lint_runs += 1
+            elif tc.name in ("write_file", "edit_file", "replace_in_file"):
+                if result.get("ok"):
+                    files_changed += 1
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -346,12 +367,21 @@ def run_task(
             log.debug("Outcome storage skipped: %s", e)
 
     else:
+        failure_reason = "Max iterations reached without completion"
         console.print("[bold red]✗ Max iterations reached without completion.[/bold red]")
         if checkpoint_tag and git_tool:
             console.print("[warn]Rolling back…[/warn]")
             git_tool.execute("git_rollback", {})
+            rollback_used = True
 
     _finalize_task(store, task_id, success, last_summary)
+    _write_run_metrics(store, task_id=task_id, started_at=started_at,
+                       success=success, iterations=iteration + 1,
+                       tool_calls=len(tool_history), files_changed=files_changed,
+                       tests_runs=tests_runs, lint_runs=lint_runs,
+                       rollback_used=rollback_used,
+                       failure_reason=failure_reason if not success else None,
+                       model=config.llm.model, client=client)
     client.close()
 
     return {
@@ -373,3 +403,37 @@ def _finalize_task(store, task_id: str | None, success: bool, summary: str) -> N
                           result={"summary": summary, "success": success})
     except Exception as e:
         log.warning("Failed to finalize task: %s", e)
+
+
+def _write_run_metrics(
+    store, *, task_id: str | None, started_at: datetime,
+    success: bool, iterations: int, tool_calls: int,
+    files_changed: int, tests_runs: int, lint_runs: int,
+    rollback_used: bool, failure_reason: str | None,
+    model: str | None, client: LLMClient | None = None,
+) -> None:
+    """Write a run_metrics row. Silently skips if store is unavailable."""
+    if not store:
+        return
+    try:
+        from mca.memory.metrics import write_metrics
+        usage = client.token_usage if client else {}
+        write_metrics(
+            store.conn,
+            task_id=task_id,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc),
+            success=success,
+            iterations=iterations,
+            tool_calls=tool_calls,
+            files_changed=files_changed,
+            tests_runs=tests_runs,
+            lint_runs=lint_runs,
+            rollback_used=rollback_used,
+            failure_reason=failure_reason,
+            model=model,
+            token_prompt=usage.get("prompt_tokens", 0),
+            token_completion=usage.get("completion_tokens", 0),
+        )
+    except Exception as e:
+        log.warning("Failed to write run metrics: %s", e)

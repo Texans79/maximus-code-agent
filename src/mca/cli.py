@@ -28,6 +28,9 @@ app.add_typer(llm_app, name="llm")
 telegram_app = typer.Typer(help="Telegram bot commands.")
 app.add_typer(telegram_app, name="telegram")
 
+metrics_app = typer.Typer(help="Run metrics and telemetry.")
+app.add_typer(metrics_app, name="metrics")
+
 
 def _resolve_workspace(workspace: str | None) -> Path:
     # If explicit path given, use it directly
@@ -338,6 +341,99 @@ def memory_recall(
             f"tags={r.get('tags',[])}[/dim]",
             border_style="green" if sim > 0.7 else "yellow",
         ))
+
+
+# ── mca metrics ──────────────────────────────────────────────────────────────
+@metrics_app.command("last")
+def metrics_last(
+    count: int = typer.Option(1, "--count", "-n", help="Number of recent runs to show."),
+) -> None:
+    """Show the most recent run metrics."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.memory.metrics import get_last
+    cfg = load_config(".")
+    store = get_store(cfg)
+    rows = get_last(store.conn, limit=count)
+    if not rows:
+        console.print("[dim]No run metrics recorded yet.[/dim]")
+        return
+    for r in rows:
+        status = "[green]SUCCESS[/green]" if r["success"] else "[red]FAIL[/red]"
+        duration = ""
+        try:
+            from datetime import datetime
+            s = datetime.fromisoformat(r["started_at"])
+            e = datetime.fromisoformat(r["ended_at"])
+            duration = f"{(e - s).total_seconds():.1f}s"
+        except Exception:
+            pass
+        fail_line = f"Failure: {r['failure_reason']}" if r.get("failure_reason") else ""
+        task_short = r["task_id"][:8] if r["task_id"] else "n/a"
+        console.print(Panel(
+            f"Status: {status}  |  Iterations: {r['iterations']}  |  "
+            f"Tool calls: {r['tool_calls']}  |  Duration: {duration}\n"
+            f"Files changed: {r['files_changed']}  |  Test runs: {r['tests_runs']}  |  "
+            f"Lint runs: {r['lint_runs']}  |  Rollback: {r['rollback_used']}\n"
+            f"Tokens: {r['token_prompt']} prompt + {r['token_completion']} completion\n"
+            f"Model: {r['model'] or 'unknown'}  |  Task: {task_short}\n"
+            f"{fail_line}",
+            title=f"Run {r['started_at'][:19]}",
+            border_style="green" if r["success"] else "red",
+        ))
+
+
+@metrics_app.command("summary")
+def metrics_summary(
+    days: int = typer.Option(7, "--days", "-d", help="Number of days to summarize."),
+) -> None:
+    """Aggregate run metrics over a time period."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.memory.metrics import get_summary
+    cfg = load_config(".")
+    store = get_store(cfg)
+    s = get_summary(store.conn, days=days)
+    table = Table(title=f"Run Metrics — Last {days} Days", show_header=True, header_style="bold cyan")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+    table.add_row("Total runs", str(s["total_runs"]))
+    table.add_row("Successes", f"[green]{s['successes']}[/green]")
+    table.add_row("Failures", f"[red]{s['failures']}[/red]")
+    table.add_row("Success rate", f"{s['success_rate']}%")
+    table.add_row("Avg iterations", f"{s['avg_iterations']}")
+    table.add_row("Avg tool calls", f"{s['avg_tool_calls']}")
+    table.add_row("Avg duration", f"{s['avg_duration_s']}s")
+    table.add_row("Total test runs", str(s["total_test_runs"]))
+    table.add_row("Total lint runs", str(s["total_lint_runs"]))
+    table.add_row("Rollbacks", str(s["rollback_count"]))
+    table.add_row("Prompt tokens", f"{s['total_prompt_tokens']:,}")
+    table.add_row("Completion tokens", f"{s['total_completion_tokens']:,}")
+    console.print(table)
+
+
+@metrics_app.command("failures")
+def metrics_failures(
+    days: int = typer.Option(30, "--days", "-d", help="Number of days to search."),
+) -> None:
+    """List failed runs in a time period."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.memory.metrics import get_failures
+    cfg = load_config(".")
+    store = get_store(cfg)
+    rows = get_failures(store.conn, days=days)
+    if not rows:
+        console.print(f"[green]No failures in the last {days} days![/green]")
+        return
+    console.print(f"[bold red]{len(rows)} failure(s) in the last {days} days[/bold red]\n")
+    for r in rows:
+        reason = r.get("failure_reason") or "unknown"
+        console.print(
+            f"  [red]✗[/red] {r['started_at'][:19]}  "
+            f"iters={r['iterations']}  tools={r['tool_calls']}  "
+            f"reason={reason}"
+        )
 
 
 if __name__ == "__main__":

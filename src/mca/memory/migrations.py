@@ -129,6 +129,30 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_knowledge_embedding_hnsw
         ON mca.knowledge USING hnsw (embedding vector_cosine_ops);
     """,
+
+    # Migration 4: run metrics table for reliability telemetry
+    """\
+    CREATE TABLE IF NOT EXISTS mca.run_metrics (
+        id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        task_id          UUID REFERENCES mca.tasks(id) ON DELETE SET NULL,
+        started_at       TIMESTAMPTZ NOT NULL,
+        ended_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        success          BOOLEAN NOT NULL DEFAULT FALSE,
+        iterations       INTEGER NOT NULL DEFAULT 0,
+        tool_calls       INTEGER NOT NULL DEFAULT 0,
+        files_changed    INTEGER NOT NULL DEFAULT 0,
+        tests_runs       INTEGER NOT NULL DEFAULT 0,
+        lint_runs        INTEGER NOT NULL DEFAULT 0,
+        rollback_used    BOOLEAN NOT NULL DEFAULT FALSE,
+        failure_reason   TEXT,
+        model            TEXT,
+        token_prompt     INTEGER NOT NULL DEFAULT 0,
+        token_completion INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_run_metrics_task ON mca.run_metrics(task_id);
+    CREATE INDEX IF NOT EXISTS idx_run_metrics_started ON mca.run_metrics(started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_run_metrics_success ON mca.run_metrics(success);
+    """,
 ]
 
 
