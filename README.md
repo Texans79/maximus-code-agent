@@ -4,7 +4,7 @@ A local-first AI coding agent with structured function calling, safety rails, mu
 
 ## Features
 
-- **Structured Function Calling**: 26 tool definitions with JSON Schema, passed to the LLM via the `tools` parameter.
+- **Structured Function Calling**: 28 tool definitions with JSON Schema, passed to the LLM via the `tools` parameter.
 - **Done Validation**: The agent cannot call `done()` unless tests have actually passed. Prevents hallucinated success.
 - **Run Metrics**: Every run records success/iterations/tool_calls/files_changed/tests/tokens to PostgreSQL.
 - **Workspace Jail**: All file operations confined to a configured workspace. Blocks traversal, symlinks, and absolute paths outside it.
@@ -102,7 +102,7 @@ mca run "refactor database queries to use connection pooling" -w ./backend -m as
 ### Tool & System Commands
 
 ```bash
-# List all 9 tools and 26 actions available to the agent
+# List all 10 tools and 28 actions available to the agent
 mca tools list --workspace ./project
 
 # Verify all tools are functional
@@ -189,7 +189,7 @@ Bot commands: `/run <task>`, `/status`, `/memory <query>`, `/rollback`, `/logs`
 
 ---
 
-## Tools (26 actions across 10 tools)
+## Tools (28 actions across 10 tools)
 
 These are the tools MCA can call during a task. The LLM decides which tools to call. It **cannot call done()** until the most recent test run passes.
 

@@ -188,7 +188,7 @@ describe("greet", () => {{
   }});
 }});
 ''',
-            "jest.config.js": "module.exports = { preset: 'ts-jest', testEnvironment: 'node' };\n",
+            "jest.config.js": "module.exports = {{ preset: 'ts-jest', testEnvironment: 'node' }};\n",
             "README.md": "# {name}\n\nA TypeScript Node.js project.\n\n## Setup\n\n```bash\nnpm install\nnpm run build\nnpm start\n```\n",
             ".gitignore": "node_modules/\ndist/\n*.js.map\n",
         },

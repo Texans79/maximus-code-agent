@@ -258,7 +258,13 @@ def tools_list(
     from mca.tools.registry import build_registry
     cfg = load_config(workspace or ".")
     ws = _resolve_workspace(workspace)
-    reg = build_registry(ws, cfg)
+    store = None
+    try:
+        from mca.memory.base import get_store
+        store = get_store(cfg)
+    except Exception:
+        pass
+    reg = build_registry(ws, cfg, memory_store=store)
     tools = reg.list_tools()
     table = Table(title="Registered Tools", show_header=True, header_style="bold cyan")
     table.add_column("Tool", style="bold")
@@ -279,7 +285,13 @@ def tools_verify(
     from mca.tools.registry import build_registry
     cfg = load_config(workspace or ".")
     ws = _resolve_workspace(workspace)
-    reg = build_registry(ws, cfg)
+    store = None
+    try:
+        from mca.memory.base import get_store
+        store = get_store(cfg)
+    except Exception:
+        pass
+    reg = build_registry(ws, cfg, memory_store=store)
     results = reg.verify_all()
     for name, result in results.items():
         status = "[success]OK[/success]" if result.ok else f"[error]FAIL: {result.error}[/error]"

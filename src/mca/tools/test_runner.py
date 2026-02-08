@@ -58,6 +58,8 @@ FRAMEWORK_COMMANDS: dict[str, str] = {
 class TestRunner(ToolBase):
     """Detect and run test frameworks, parse results."""
 
+    __test__ = False  # Prevent pytest from collecting this as a test class
+
     def __init__(self, shell: SafeShell, workspace: Path) -> None:
         self._shell = shell
         self._workspace = workspace
