@@ -26,7 +26,8 @@ class ShellTool(ToolBase):
     def execute(self, action: str, args: dict[str, Any]) -> ToolResult:
         if action != "run_command":
             raise ValueError(f"Unknown shell action: {action}")
-        result = self._shell.run(args["cmd"])
+        cmd = args.get("cmd") or args.get("command", "")
+        result = self._shell.run(cmd)
         return ToolResult(
             ok=result.exit_code == 0,
             data={

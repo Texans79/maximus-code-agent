@@ -1,6 +1,11 @@
-"""Demo app — a simple calculator for MCA to work on."""
+def hello(name):
+    return f'Hello, {name}!'
 
-
+def power(base, exponent):
+    result = 1
+    for _ in range(exponent):
+        result *= base
+    return result
 def add(a: float, b: float) -> float:
     """Add two numbers."""
     return a + b

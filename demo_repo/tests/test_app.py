@@ -1,7 +1,14 @@
-"""Tests for the demo calculator app."""
-import pytest
-from app import add, subtract, multiply, divide
+import unittest
+from app import hello
 
+class TestApp(unittest.TestCase):
+    def test_power(self):
+        self.assertEqual(power(2, 3), 8)
+        self.assertEqual(power(5, 0), 1)
+
+class TestHello(unittest.TestCase):
+    def test_hello(self):
+        self.assertEqual(hello('World'), 'Hello, World!')
 
 class TestAdd:
     def test_positive(self):

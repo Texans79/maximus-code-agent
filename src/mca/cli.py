@@ -30,9 +30,13 @@ app.add_typer(telegram_app, name="telegram")
 
 
 def _resolve_workspace(workspace: str | None) -> Path:
-    from mca.config import load_config
-    cfg = load_config(workspace or ".")
-    ws = Path(cfg.workspace).resolve()
+    # If explicit path given, use it directly
+    if workspace:
+        ws = Path(workspace).resolve()
+    else:
+        from mca.config import load_config
+        cfg = load_config(".")
+        ws = Path(cfg.workspace).resolve()
     if not ws.exists():
         console.print(f"[error]Workspace not found: {ws}[/error]")
         raise typer.Exit(1)

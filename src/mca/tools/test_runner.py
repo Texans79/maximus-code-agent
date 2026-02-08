@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -11,15 +13,46 @@ from mca.tools.safe_shell import SafeShell
 
 log = get_logger("test_runner")
 
-# (framework, marker_files, command)
-DETECTORS: list[tuple[str, list[str], str]] = [
-    ("pytest", ["conftest.py", "pytest.ini", "pyproject.toml"],
-     "python -m pytest --tb=short -q"),
-    ("jest", ["jest.config.js", "jest.config.ts", "jest.config.mjs"],
-     "npx jest --no-coverage"),
-    ("go_test", ["go.mod"], "go test ./..."),
-    ("cargo_test", ["Cargo.toml"], "cargo test"),
+
+def _find_python(workspace: Path) -> str:
+    """Find the best Python interpreter for a workspace.
+
+    Priority:
+    1. Workspace .venv/bin/python (project's own venv)
+    2. Workspace venv/bin/python
+    3. sys.executable (the Python running MCA — has pytest)
+    4. python3 on PATH
+    5. python on PATH (fallback)
+    """
+    for venv_dir in (".venv", "venv"):
+        venv_python = workspace / venv_dir / "bin" / "python"
+        if venv_python.exists():
+            return str(venv_python)
+
+    # Use MCA's own Python — guaranteed to have pytest
+    if sys.executable:
+        return sys.executable
+
+    for name in ("python3", "python"):
+        if shutil.which(name):
+            return name
+
+    return "python3"
+
+
+# (framework, marker_files) — command built dynamically with correct python
+DETECTORS: list[tuple[str, list[str]]] = [
+    ("pytest", ["conftest.py", "pytest.ini", "pyproject.toml"]),
+    ("jest", ["jest.config.js", "jest.config.ts", "jest.config.mjs"]),
+    ("go_test", ["go.mod"]),
+    ("cargo_test", ["Cargo.toml"]),
 ]
+
+FRAMEWORK_COMMANDS: dict[str, str] = {
+    "jest": "npx jest --no-coverage",
+    "go_test": "go test ./...",
+    "cargo_test": "cargo test",
+}
 
 
 class TestRunner(ToolBase):
@@ -28,6 +61,7 @@ class TestRunner(ToolBase):
     def __init__(self, shell: SafeShell, workspace: Path) -> None:
         self._shell = shell
         self._workspace = workspace
+        self._python = _find_python(workspace)
 
     @property
     def name(self) -> str:
@@ -43,9 +77,12 @@ class TestRunner(ToolBase):
             "detect_test_framework": "Detect which test framework the project uses",
         }
 
+    def _pytest_cmd(self) -> str:
+        return f"{self._python} -m pytest --tb=short -q"
+
     def detect_framework(self) -> tuple[str, str] | None:
         """Return (framework_name, run_command) or None."""
-        for framework, markers, cmd in DETECTORS:
+        for framework, markers in DETECTORS:
             for marker in markers:
                 path = self._workspace / marker
                 if not path.exists():
@@ -55,10 +92,11 @@ class TestRunner(ToolBase):
                         continue
                 if framework == "jest" and marker.startswith("jest.config"):
                     pass  # config file existence is sufficient
+                cmd = self._pytest_cmd() if framework == "pytest" else FRAMEWORK_COMMANDS[framework]
                 return framework, cmd
         # Fallback: tests/ directory → pytest
         if (self._workspace / "tests").is_dir():
-            return "pytest", "python -m pytest --tb=short -q"
+            return "pytest", self._pytest_cmd()
         return None
 
     def _parse_pytest(self, stdout: str, stderr: str) -> dict:
