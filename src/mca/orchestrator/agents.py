@@ -1,4 +1,7 @@
-"""Multi-agent review pipeline: Planner → Implementer → Reviewer → Tester."""
+"""Multi-agent review pipeline: Planner → Implementer → Reviewer → Tester.
+
+Uses LLMClient for inference (no OpenAI dependency).
+"""
 from __future__ import annotations
 
 import json
@@ -7,9 +10,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
-
 from mca.config import Config
+from mca.llm.client import LLMClient, get_client
 from mca.log import console, get_logger
 from mca.utils.secrets import redact
 
@@ -90,8 +92,7 @@ class AgentResult:
 
 
 def _call_agent(
-    client: OpenAI,
-    model: str,
+    client: LLMClient,
     role: Role,
     context: str,
     task: str,
@@ -109,13 +110,12 @@ def _call_agent(
     ]
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        resp = client.chat(
             messages=messages,
             temperature=config.llm.temperature,
             max_tokens=config.llm.max_tokens,
         )
-        content = resp.choices[0].message.content or ""
+        content = resp.content or ""
         # Try to parse JSON
         parsed = {}
         try:
@@ -139,8 +139,7 @@ def run_pipeline(
     config: Config,
 ) -> dict[str, Any]:
     """Run the sequential multi-agent pipeline."""
-    client = OpenAI(base_url=config.llm.base_url, api_key=config.llm.api_key)
-    model = config.llm.model
+    client = get_client(config)
     results: list[AgentResult] = []
 
     pipeline = [Role.PLANNER, Role.IMPLEMENTER, Role.REVIEWER, Role.TESTER]
@@ -148,7 +147,7 @@ def run_pipeline(
     for role in pipeline:
         console.print(f"\n[bold magenta]═══ {role.value.upper()} ═══[/bold magenta]")
 
-        result = _call_agent(client, model, role, context, task, results, config)
+        result = _call_agent(client, role, context, task, results, config)
         results.append(result)
 
         if not result.success:
@@ -165,11 +164,14 @@ def run_pipeline(
                 issues = result.parsed.get("issues", [])
                 console.print(f"[warn]Reviewer requested changes ({len(issues)} issues)[/warn]")
                 for issue in issues[:5]:
-                    console.print(f"  [{issue.get('severity', 'info')}] {issue.get('file', '?')}: {issue.get('description', '')}")
+                    console.print(f"  [{issue.get('severity', 'info')}] {issue.get('file', '?')}: "
+                                  f"{issue.get('description', '')}")
 
                 missing = result.parsed.get("missing_tests", [])
                 if missing:
                     console.print(f"[warn]Missing tests: {missing}[/warn]")
+
+    client.close()
 
     return {
         "pipeline_results": [

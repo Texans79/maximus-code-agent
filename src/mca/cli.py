@@ -19,6 +19,12 @@ app = typer.Typer(
 memory_app = typer.Typer(help="Long-term memory commands.")
 app.add_typer(memory_app, name="memory")
 
+tools_app = typer.Typer(help="Tool registry commands.")
+app.add_typer(tools_app, name="tools")
+
+llm_app = typer.Typer(help="LLM endpoint commands.")
+app.add_typer(llm_app, name="llm")
+
 telegram_app = typer.Typer(help="Telegram bot commands.")
 app.add_typer(telegram_app, name="telegram")
 
@@ -139,14 +145,27 @@ def memory_add(
                                   help="Category: general|decision|recipe|pattern|error|context"),
     workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
 ) -> None:
-    """Store a knowledge entry in long-term memory."""
+    """Store a knowledge entry in long-term memory (auto-embeds via Ollama)."""
     from mca.config import load_config
     from mca.memory.base import get_store
     cfg = load_config(workspace or ".")
     store = get_store(cfg)
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
-    mid = store.add(content=content, tags=tag_list, project=str(Path.cwd()), category=category)
-    console.print(f"[success]Stored memory {mid} ({store.backend_name})[/success]")
+
+    # Auto-embed for vector similarity search
+    embedding = None
+    try:
+        from mca.memory.embeddings import get_embedder
+        emb = get_embedder(cfg)
+        embedding = emb.embed(content)
+        emb.close()
+    except Exception as e:
+        console.print(f"[dim]Embedding skipped: {e}[/dim]")
+
+    mid = store.add(content=content, tags=tag_list, project=str(Path.cwd()),
+                    category=category, embedding=embedding)
+    console.print(f"[success]Stored memory {mid} ({store.backend_name})"
+                  f"{' + embedding' if embedding else ''}[/success]")
 
 
 @memory_app.command("search")
@@ -188,6 +207,133 @@ def telegram_start(
     from mca.telegram.bot import start_bot
     console.print("[info]Starting Telegram bot…[/info]")
     start_bot(cfg)
+
+
+# ── mca embed ───────────────────────────────────────────────────────────────
+@app.command()
+def embed(
+    text: str = typer.Argument(..., help="Text to embed."),
+) -> None:
+    """Generate an embedding vector for text via Ollama."""
+    from mca.memory.embeddings import get_embedder
+    emb = get_embedder()
+    vec = emb.embed(text)
+    emb.close()
+    console.print(f"[bold]Model:[/bold] {emb.model}")
+    console.print(f"[bold]Dimensions:[/bold] {len(vec)}")
+    console.print(f"[bold]Sample:[/bold] [{vec[0]:.6f}, {vec[1]:.6f}, … {vec[-1]:.6f}]")
+
+
+# ── mca llm ─────────────────────────────────────────────────────────────────
+@llm_app.command("ping")
+def llm_ping() -> None:
+    """Verify the vLLM endpoint is reachable."""
+    from mca.llm.client import get_client
+    client = get_client()
+    result = client.ping()
+    client.close()
+    if result["ok"]:
+        console.print(f"[success]vLLM OK[/success] — {result['endpoint']}")
+        for m in result["models"]:
+            console.print(f"  [bold]{m}[/bold]")
+    else:
+        console.print(f"[error]vLLM unreachable: {result.get('error', 'unknown')}[/error]")
+        raise typer.Exit(1)
+
+
+# ── mca tools ───────────────────────────────────────────────────────────────
+@tools_app.command("list")
+def tools_list(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """List all registered tools and their actions."""
+    from mca.config import load_config
+    from mca.tools.registry import build_registry
+    cfg = load_config(workspace or ".")
+    ws = _resolve_workspace(workspace)
+    reg = build_registry(ws, cfg)
+    tools = reg.list_tools()
+    table = Table(title="Registered Tools", show_header=True, header_style="bold cyan")
+    table.add_column("Tool", style="bold")
+    table.add_column("Actions", justify="right")
+    table.add_column("Description")
+    for t in tools:
+        table.add_row(t["name"], str(len(t["actions"])), t["description"])
+    console.print(table)
+    console.print(f"\n[dim]{sum(len(t['actions']) for t in tools)} total actions across {len(tools)} tools[/dim]")
+
+
+@tools_app.command("verify")
+def tools_verify(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Verify all tools are functional."""
+    from mca.config import load_config
+    from mca.tools.registry import build_registry
+    cfg = load_config(workspace or ".")
+    ws = _resolve_workspace(workspace)
+    reg = build_registry(ws, cfg)
+    results = reg.verify_all()
+    for name, result in results.items():
+        status = "[success]OK[/success]" if result.ok else f"[error]FAIL: {result.error}[/error]"
+        console.print(f"  {name}: {status}")
+
+
+# ── mca test ────────────────────────────────────────────────────────────────
+@app.command("test")
+def test_cmd(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Detect and run project tests."""
+    from mca.config import load_config
+    from mca.tools.registry import build_registry
+    cfg = load_config(workspace or ".")
+    ws = _resolve_workspace(workspace)
+    reg = build_registry(ws, cfg)
+    runner = reg.get_tool("test_runner")
+    if not runner:
+        console.print("[error]TestRunner tool not available[/error]")
+        raise typer.Exit(1)
+    result = runner.execute("run_tests", {})
+    if result.ok:
+        d = result.data
+        console.print(f"[success]Tests passed[/success] — {d.get('framework', '?')}")
+        console.print(f"  passed={d.get('passed', '?')} failed={d.get('failed', '?')}")
+    else:
+        console.print(f"[error]Tests failed: {result.error}[/error]")
+        if result.data.get("stdout"):
+            console.print(result.data["stdout"][-2000:])
+        raise typer.Exit(1)
+
+
+# ── mca memory recall ──────────────────────────────────────────────────────
+@memory_app.command("recall")
+def memory_recall(
+    query: str = typer.Argument(..., help="Task or query to find similar past work."),
+    limit: int = typer.Option(5, "--limit", "-n"),
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Recall similar past tasks/knowledge via pgvector."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.memory.recall import recall_similar
+    from mca.memory.embeddings import get_embedder
+    cfg = load_config(workspace or ".")
+    store = get_store(cfg)
+    embedder = get_embedder(cfg)
+    results = recall_similar(store, embedder, query, limit=limit)
+    embedder.close()
+    if not results:
+        console.print("[dim]No similar entries found.[/dim]")
+        return
+    console.print(f"[bold]{len(results)} similar entries[/bold] (backend: {store.backend_name})")
+    for r in results:
+        sim = r.get("similarity", 0)
+        console.print(Panel(
+            f"{r['content']}\n[dim]similarity={sim:.4f} | category={r.get('category','general')} | "
+            f"tags={r.get('tags',[])}[/dim]",
+            border_style="green" if sim > 0.7 else "yellow",
+        ))
 
 
 if __name__ == "__main__":

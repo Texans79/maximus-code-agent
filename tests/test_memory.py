@@ -79,7 +79,7 @@ class TestSqliteKnowledge:
         assert entry["category"] == "general"
 
     def test_vector_search_returns_empty(self, store):
-        results = store.vector_search([0.1] * 384, limit=5)
+        results = store.vector_search([0.1] * 768, limit=5)
         assert results == []
 
 
@@ -244,11 +244,11 @@ class TestPgVectorSearch:
     def test_insert_and_search_embedding(self, pg_store):
         # Create directionally distinct embeddings (384 dims)
         # emb_a: high values in first half, low in second
-        emb_a = [0.9] * 192 + [0.1] * 192
+        emb_a = [0.9] * 384 + [0.1] * 384
         # emb_b: low values in first half, high in second (opposite direction)
-        emb_b = [0.1] * 192 + [0.9] * 192
+        emb_b = [0.1] * 384 + [0.9] * 384
         # query: very similar to emb_a
-        emb_query = [0.85] * 192 + [0.15] * 192
+        emb_query = [0.85] * 384 + [0.15] * 384
 
         pg_store.add("entry close to query", embedding=emb_a)
         pg_store.add("entry far from query", embedding=emb_b)
@@ -261,7 +261,7 @@ class TestPgVectorSearch:
         assert results[0]["similarity"] > results[1]["similarity"]
 
     def test_vector_search_with_project_filter(self, pg_store):
-        emb = [0.5] * 384
+        emb = [0.5] * 768
         pg_store.add("project A note", embedding=emb, project="proj-a")
         pg_store.add("project B note", embedding=emb, project="proj-b")
 

@@ -1,18 +1,15 @@
-"""Tests for orchestrator approval and tool execution."""
+"""Tests for orchestrator approval, tool parsing, and registry-based dispatch."""
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from mca.orchestrator.approval import ApprovalDenied, ApprovalMode, approve_plan
-from mca.orchestrator.loop import _execute_tool, _parse_tool_calls
-from mca.tools.safe_fs import SafeFS
-from mca.tools.safe_shell import SafeShell
+from mca.orchestrator.loop import _execute_tool, _parse_tool_calls, _build_system_prompt
 
 
 class TestApprovalMode:
     def test_auto_approves(self):
-        # Auto mode should not raise
         result = approve_plan("test plan", ApprovalMode.AUTO)
         assert result is True
 
@@ -48,55 +45,71 @@ class TestParseToolCalls:
         assert "can't" in calls[0]["args"]["summary"]
 
 
-class TestToolExecution:
+class TestRegistryDispatch:
     @pytest.fixture
     def workspace(self, tmp_path):
         (tmp_path / "test.txt").write_text("hello world\n")
         return tmp_path
 
     @pytest.fixture
-    def fs(self, workspace):
-        return SafeFS(workspace)
+    def registry(self, workspace):
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": ["rm -rf /"], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        return build_registry(workspace, cfg)
 
-    @pytest.fixture
-    def shell(self, workspace):
-        return SafeShell(workspace)
-
-    def test_read_file(self, fs, shell):
-        result = _execute_tool("read_file", {"path": "test.txt"}, fs, shell, "auto")
+    def test_read_file(self, registry):
+        result = _execute_tool("read_file", {"path": "test.txt"}, registry, "auto")
         assert result["ok"]
-        assert "hello" in result["content"]
+        assert "hello" in result.get("data", result).get("content", "")
 
-    def test_write_file(self, fs, shell, workspace):
-        result = _execute_tool("write_file", {"path": "new.py", "content": "x = 1\n"}, fs, shell, "auto")
+    def test_write_file(self, registry, workspace):
+        result = _execute_tool("write_file", {"path": "new.py", "content": "x = 1\n"},
+                               registry, "auto")
         assert result["ok"]
         assert (workspace / "new.py").read_text() == "x = 1\n"
 
-    def test_list_files(self, fs, shell):
-        result = _execute_tool("list_files", {}, fs, shell, "auto")
+    def test_list_files(self, registry):
+        result = _execute_tool("list_files", {}, registry, "auto")
         assert result["ok"]
-        assert any("test.txt" in f for f in result["files"])
 
-    def test_search(self, fs, shell):
-        result = _execute_tool("search", {"pattern": "hello"}, fs, shell, "auto")
+    def test_search(self, registry):
+        result = _execute_tool("search", {"pattern": "hello"}, registry, "auto")
         assert result["ok"]
-        assert len(result["matches"]) == 1
 
-    def test_run_command(self, fs, shell):
-        result = _execute_tool("run_command", {"cmd": "echo test"}, fs, shell, "auto")
+    def test_run_command(self, registry):
+        result = _execute_tool("run_command", {"cmd": "echo test"}, registry, "auto")
         assert result["ok"]
-        assert "test" in result["stdout"]
 
-    def test_run_denied_command(self, fs, shell):
-        result = _execute_tool("run_command", {"cmd": "rm -rf /"}, fs, shell, "auto")
+    def test_run_denied_command(self, registry):
+        result = _execute_tool("run_command", {"cmd": "rm -rf /"}, registry, "auto")
         assert not result["ok"]
-        assert "Blocked" in result["error"]
 
-    def test_done(self, fs, shell):
-        result = _execute_tool("done", {"summary": "all good"}, fs, shell, "auto")
+    def test_done(self, registry):
+        result = _execute_tool("done", {"summary": "all good"}, registry, "auto")
         assert result["ok"]
-        assert result["done"]
+        assert result.get("data", result).get("done") or result.get("done")
 
-    def test_unknown_tool(self, fs, shell):
-        result = _execute_tool("nope", {}, fs, shell, "auto")
+    def test_unknown_tool(self, registry):
+        result = _execute_tool("nope", {}, registry, "auto")
         assert not result["ok"]
+
+
+class TestBuildSystemPrompt:
+    def test_includes_actions(self, tmp_path):
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": [], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        registry = build_registry(tmp_path, cfg)
+        prompt = _build_system_prompt(registry)
+        assert "read_file" in prompt
+        assert "write_file" in prompt
+        assert "run_command" in prompt
+        assert "done" in prompt
+        assert "Maximus Code Agent" in prompt

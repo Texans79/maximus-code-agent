@@ -120,6 +120,15 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_knowledge_embedding_hnsw
         ON mca.knowledge USING hnsw (embedding vector_cosine_ops);
     """,
+
+    # Migration 3: expand embedding dimension from 384 to 768
+    # (nomic-embed-text outputs 768-dim vectors)
+    """\
+    DROP INDEX IF EXISTS mca.idx_knowledge_embedding_hnsw;
+    ALTER TABLE mca.knowledge ALTER COLUMN embedding TYPE vector(768);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_embedding_hnsw
+        ON mca.knowledge USING hnsw (embedding vector_cosine_ops);
+    """,
 ]
 
 

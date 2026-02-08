@@ -1,4 +1,8 @@
-"""Orchestrator loop: plan → edit → run → fix → verify."""
+"""Orchestrator loop: plan → implement → review → test.
+
+Uses ToolRegistry for dispatch, LLMClient for inference, and PostgreSQL
+for task/step/artifact tracking.
+"""
 from __future__ import annotations
 
 import json
@@ -6,30 +10,30 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
-
 from mca.config import Config
+from mca.llm.client import LLMClient, LLMResponse, get_client
 from mca.log import console, get_logger
 from mca.orchestrator.approval import ApprovalDenied, approve_command, approve_diff, approve_plan
-from mca.tools.git_ops import GitOps
+from mca.tools.base import ToolResult
+from mca.tools.registry import ToolRegistry, build_registry
 from mca.tools.safe_fs import SafeFS
-from mca.tools.safe_shell import SafeShell, DeniedCommandError
+from mca.tools.safe_shell import DeniedCommandError
 from mca.utils.secrets import redact
 
 log = get_logger("orchestrator")
 
 MAX_ITERATIONS = 10
-SYSTEM_PROMPT = """\
-You are Maximus Code Agent (MCA), an expert AI coding assistant.
-You operate on a workspace directory. You have these tools:
 
-1. read_file(path) — read a file (relative to workspace)
-2. write_file(path, content) — create or overwrite a file
-3. edit_file(path, diff) — apply a unified diff patch to an existing file
-4. search(pattern, glob) — grep for a pattern in workspace files
-5. list_files() — list workspace file tree
-6. run_command(cmd) — execute a shell command in the workspace
-7. done(summary) — signal task completion with a summary
+
+def _build_system_prompt(registry: ToolRegistry) -> str:
+    """Build dynamic system prompt from registered tools."""
+    actions = registry.list_actions()
+    tool_desc = "\n".join(f"- {name}: {desc}" for name, desc in actions.items())
+    return f"""\
+You are Maximus Code Agent (MCA), an expert AI coding assistant.
+You operate on a workspace directory. Available actions:
+
+{tool_desc}
 
 RULES:
 - ALWAYS prefer edit_file with diffs over write_file for existing files.
@@ -38,12 +42,12 @@ RULES:
 - Generate minimal tests if none exist.
 - Be concise. Explain what you change and why.
 - Never leak secrets or environment variables.
+- Call done(summary) when the task is complete.
 
 Respond with a JSON array of tool calls:
-[{"tool": "tool_name", "args": {"key": "value"}}]
+[{{"tool": "action_name", "args": {{"key": "value"}}}}]
 
-Only respond with the JSON array, no other text.
-"""
+Only respond with the JSON array, no other text."""
 
 
 def _build_context(fs: SafeFS) -> str:
@@ -55,16 +59,15 @@ def _build_context(fs: SafeFS) -> str:
     return f"Workspace files:\n{tree_str}"
 
 
-def _call_llm(client: OpenAI, model: str, messages: list[dict], config: Config) -> str:
+def _call_llm(client: LLMClient, messages: list[dict], config: Config) -> str:
     """Call the LLM and return the assistant message content."""
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        resp = client.chat(
             messages=messages,
             temperature=config.llm.temperature,
             max_tokens=config.llm.max_tokens,
         )
-        return resp.choices[0].message.content or ""
+        return resp.content or ""
     except Exception as e:
         log.error("LLM call failed: %s", e)
         return json.dumps([{"tool": "done", "args": {"summary": f"LLM error: {e}"}}])
@@ -75,7 +78,6 @@ def _parse_tool_calls(text: str) -> list[dict]:
     text = text.strip()
     # Try to find JSON array in the response
     if not text.startswith("["):
-        # Look for JSON block
         start = text.find("[")
         end = text.rfind("]")
         if start >= 0 and end > start:
@@ -95,62 +97,21 @@ def _parse_tool_calls(text: str) -> list[dict]:
 def _execute_tool(
     tool: str,
     args: dict,
-    fs: SafeFS,
-    shell: SafeShell,
+    registry: ToolRegistry,
     approval_mode: str,
 ) -> dict[str, Any]:
-    """Execute a single tool call. Returns result dict."""
+    """Execute a tool call via the registry with approval checks."""
     try:
-        if tool == "read_file":
-            content = fs.read(args["path"])
-            # Truncate for context window
-            if len(content) > 8000:
-                content = content[:8000] + "\n… [truncated]"
-            return {"ok": True, "content": content}
+        # Approval checks for write/command actions
+        if tool == "write_file" and approval_mode != "auto":
+            approve_diff(args.get("path", "?"), "(new file)", approval_mode)
+        elif tool == "edit_file" and approval_mode != "auto":
+            approve_diff(args.get("path", "?"), args.get("diff", ""), approval_mode)
+        elif tool == "run_command" and approval_mode != "auto":
+            approve_command(args.get("cmd", ""), approval_mode)
 
-        elif tool == "write_file":
-            path = args["path"]
-            content = args["content"]
-            diff = fs.generate_diff(path, content)
-            if diff:
-                approve_diff(path, diff, approval_mode)
-            fs.write_force(path, content)
-            return {"ok": True, "wrote": path, "bytes": len(content)}
-
-        elif tool == "edit_file":
-            path = args["path"]
-            diff = args["diff"]
-            approve_diff(path, diff, approval_mode)
-            ok = fs.apply_diff(path, diff)
-            return {"ok": ok, "edited": path}
-
-        elif tool == "search":
-            results = fs.search(args["pattern"], args.get("glob", "**/*"))
-            # Limit results
-            truncated = len(results) > 50
-            results = results[:50]
-            return {"ok": True, "matches": results, "truncated": truncated}
-
-        elif tool == "list_files":
-            tree = fs.tree(max_depth=args.get("depth", 3))
-            return {"ok": True, "files": tree[:200]}
-
-        elif tool == "run_command":
-            cmd = args["cmd"]
-            approve_command(cmd, approval_mode)
-            result = shell.run(cmd)
-            return {
-                "ok": result.exit_code == 0,
-                "exit_code": result.exit_code,
-                "stdout": redact(result.stdout[:5000]),
-                "stderr": redact(result.stderr[:2000]),
-            }
-
-        elif tool == "done":
-            return {"ok": True, "done": True, "summary": args.get("summary", "")}
-
-        else:
-            return {"ok": False, "error": f"Unknown tool: {tool}"}
+        result = registry.dispatch(tool, args)
+        return result.to_dict()
 
     except ApprovalDenied as e:
         return {"ok": False, "error": f"Denied: {e}"}
@@ -166,80 +127,132 @@ def run_task(
     config: Config,
     approval_mode: str = "ask",
 ) -> dict[str, Any]:
-    """Run the full orchestrator loop for a task."""
+    """Run the full orchestrator loop for a task.
+
+    Builds the tool registry, connects to LLM, creates a Postgres task
+    record, and iterates until done or max iterations.
+    """
     log.info("Starting task: %s", task)
     log.info("Workspace: %s, Mode: %s", workspace, approval_mode)
 
-    # Initialize tools
-    fs = SafeFS(workspace)
-    shell = SafeShell(
-        workspace=workspace,
-        denylist=config.shell.as_dict().get("denylist", []),
-        allowlist=config.shell.as_dict().get("allowlist", []),
-        timeout=config.shell.timeout,
-    )
-    git = GitOps(workspace)
+    # ── Initialize memory store ──────────────────────────────────────────
+    store = None
+    task_id = None
+    try:
+        from mca.memory.base import get_store
+        store = get_store(config)
+        task_id = store.create_task(task, workspace=str(workspace))
+        store.update_task(task_id, status="running")
+        log.info("Task recorded: %s", task_id[:8])
+    except Exception as e:
+        log.warning("Memory store unavailable: %s", e)
 
-    # Git checkpoint
+    # ── Build registry ───────────────────────────────────────────────────
+    registry = build_registry(workspace, config, memory_store=store)
+    system_prompt = _build_system_prompt(registry)
+
+    # ── Git checkpoint ───────────────────────────────────────────────────
+    git_tool = registry.get_tool("git")
     checkpoint_tag = None
-    if config.git.auto_checkpoint:
-        git.ensure_repo()
-        checkpoint_tag = git.checkpoint(f"MCA start: {task[:60]}")
-        console.print(f"[dim]Git checkpoint: {checkpoint_tag}[/dim]")
+    if config.git.auto_checkpoint and git_tool:
+        try:
+            result = git_tool.execute("git_checkpoint", {"message": f"MCA start: {task[:60]}"})
+            if result.ok:
+                checkpoint_tag = result.data.get("tag", "")
+                console.print(f"[dim]Git checkpoint: {checkpoint_tag}[/dim]")
+        except Exception as e:
+            log.warning("Git checkpoint failed: %s", e)
 
-    # LLM client
-    client = OpenAI(
-        base_url=config.llm.base_url,
-        api_key=config.llm.api_key,
-    )
-    model = config.llm.model
+    # ── LLM client ───────────────────────────────────────────────────────
+    client = get_client(config)
 
-    # Build initial messages
-    context = _build_context(fs)
+    # ── Memory recall (inject similar past work) ─────────────────────────
+    recall_context = ""
+    try:
+        from mca.memory.recall import recall_similar
+        from mca.memory.embeddings import get_embedder
+        embedder = get_embedder(config)
+        similar = recall_similar(store, embedder, task, limit=3)
+        embedder.close()
+        if similar:
+            recall_parts = []
+            for s in similar:
+                recall_parts.append(f"- [{s.get('category','general')}] {s['content'][:200]}")
+            recall_context = "\n\nRelevant past work:\n" + "\n".join(recall_parts)
+            log.info("Injected %d recall entries", len(similar))
+    except Exception as e:
+        log.debug("Memory recall skipped: %s", e)
+
+    # ── Build initial messages ───────────────────────────────────────────
+    fs_tool = registry.get_tool("filesystem")
+    context = ""
+    if fs_tool:
+        ctx_result = fs_tool.execute("list_files", {})
+        if ctx_result.ok:
+            files = ctx_result.data.get("files", [])
+            context = "Workspace files:\n" + "\n".join(f"  {f}" for f in files[:100])
+
     messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"{context}\n\nTask: {task}"},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"{context}{recall_context}\n\nTask: {task}"},
     ]
 
-    # Show plan approval in ask mode
+    # ── Plan approval ────────────────────────────────────────────────────
     if approval_mode in ("ask", "paranoid"):
-        # First LLM call to get the plan
         console.print("[info]Generating plan…[/info]")
-        plan_response = _call_llm(client, model, messages, config)
+        plan_response = _call_llm(client, messages, config)
         try:
             approve_plan(f"Task: {task}\n\nLLM proposed actions:\n{plan_response[:2000]}", approval_mode)
         except ApprovalDenied:
-            if checkpoint_tag:
-                git.rollback()
+            if checkpoint_tag and git_tool:
+                git_tool.execute("git_rollback", {})
+            _finalize_task(store, task_id, False, "Plan rejected by user")
+            client.close()
             return {"success": False, "error": "Plan rejected by user"}
-        # Add plan response to conversation
         messages.append({"role": "assistant", "content": plan_response})
     else:
-        # Auto mode — just get the first response
-        plan_response = _call_llm(client, model, messages, config)
+        plan_response = _call_llm(client, messages, config)
         messages.append({"role": "assistant", "content": plan_response})
 
-    # Iteration loop
+    # ── Record plan step ─────────────────────────────────────────────────
+    if store and task_id:
+        try:
+            step_id = store.add_step(task_id, "plan", agent_role="planner")
+            store.update_step(step_id, status="completed",
+                              output={"plan": plan_response[:2000]})
+        except Exception:
+            pass
+
+    # ── Iteration loop ───────────────────────────────────────────────────
     last_summary = ""
     success = False
+    iteration = 0
 
     for iteration in range(MAX_ITERATIONS):
         console.print(f"\n[bold cyan]── Iteration {iteration + 1}/{MAX_ITERATIONS} ──[/bold cyan]")
 
-        # Parse tool calls from last LLM response
         last_content = messages[-1]["content"] if messages[-1]["role"] == "assistant" else plan_response
         tool_calls = _parse_tool_calls(last_content)
 
-        # Execute each tool call
         results: list[dict] = []
         done = False
         for tc in tool_calls:
             tool_name = tc.get("tool", "")
             tool_args = tc.get("args", {})
-            console.print(f"  [bold]→ {tool_name}[/bold]({', '.join(f'{k}={v!r}' for k, v in list(tool_args.items())[:3])})")
+            console.print(f"  [bold]→ {tool_name}[/bold]"
+                          f"({', '.join(f'{k}={v!r}' for k, v in list(tool_args.items())[:3])})")
 
-            result = _execute_tool(tool_name, tool_args, fs, shell, approval_mode)
+            result = _execute_tool(tool_name, tool_args, registry, approval_mode)
             results.append({"tool": tool_name, "result": result})
+
+            # Log tool execution
+            if store and task_id:
+                try:
+                    store.log_tool(task_id, tool_name,
+                                   command=json.dumps(tool_args)[:500],
+                                   exit_code=0 if result.get("ok") else 1)
+                except Exception:
+                    pass
 
             if result.get("done"):
                 done = True
@@ -250,32 +263,59 @@ def run_task(
             success = True
             break
 
-        # Feed results back to LLM
         feedback = json.dumps(results, indent=2, default=str)
         messages.append({"role": "user", "content": f"Tool results:\n{feedback}"})
 
-        # Get next LLM action
         console.print("[dim]  Thinking…[/dim]")
-        next_response = _call_llm(client, model, messages, config)
+        next_response = _call_llm(client, messages, config)
         messages.append({"role": "assistant", "content": next_response})
 
-    # Final summary
+    # ── Finalize ─────────────────────────────────────────────────────────
     if success:
         console.print(f"\n[success]Summary: {last_summary}[/success]")
-        if checkpoint_tag:
-            git.checkpoint(f"MCA done: {task[:60]}")
+        if checkpoint_tag and git_tool:
+            git_tool.execute("git_checkpoint", {"message": f"MCA done: {task[:60]}"})
+
+        # Store outcome for future recall
+        try:
+            from mca.memory.recall import store_outcome
+            from mca.memory.embeddings import get_embedder
+            embedder = get_embedder(config)
+            diff = ""
+            if git_tool:
+                diff_result = git_tool.execute("git_diff", {})
+                if diff_result.ok:
+                    diff = diff_result.data.get("diff", "")
+            store_outcome(store, embedder, task_id or "unknown", last_summary,
+                          outcome="completed", diff=diff, project=str(workspace))
+            embedder.close()
+        except Exception as e:
+            log.debug("Outcome storage skipped: %s", e)
+
     else:
         console.print("[error]Max iterations reached without completion.[/error]")
-        if checkpoint_tag:
+        if checkpoint_tag and git_tool:
             console.print("[warn]Rolling back…[/warn]")
-            git.rollback()
+            git_tool.execute("git_rollback", {})
+
+    _finalize_task(store, task_id, success, last_summary)
+    client.close()
 
     return {
         "success": success,
         "summary": last_summary,
-        "iterations": min(iteration + 1, MAX_ITERATIONS) if 'iteration' in dir() else 0,
-        "shell_history": [
-            {"cmd": r.command, "exit": r.exit_code, "duration": r.duration_s}
-            for r in shell.history
-        ],
+        "iterations": iteration + 1,
+        "task_id": task_id,
     }
+
+
+def _finalize_task(store, task_id: str | None, success: bool, summary: str) -> None:
+    """Update the task record with final status."""
+    if not store or not task_id:
+        return
+    try:
+        status = "completed" if success else "failed"
+        store.update_task(task_id, status=status,
+                          result={"summary": summary, "success": success})
+    except Exception as e:
+        log.warning("Failed to finalize task: %s", e)
