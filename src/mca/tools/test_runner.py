@@ -197,6 +197,12 @@ class TestRunner(ToolBase):
             }
             summary = parsers.get(framework, lambda: {})()
 
+            failed = summary.get("failed", 0)
+            errors = summary.get("errors", 0)
+            error_msg = ""
+            if result.exit_code != 0:
+                error_msg = f"{failed} failed, {errors} errors"
+
             return ToolResult(
                 ok=result.exit_code == 0,
                 data={
@@ -205,6 +211,7 @@ class TestRunner(ToolBase):
                     "exit_code": result.exit_code,
                     "output": (result.stdout + result.stderr)[:5000],
                 },
+                error=error_msg,
             )
 
         raise ValueError(f"Unknown test_runner action: {action}")

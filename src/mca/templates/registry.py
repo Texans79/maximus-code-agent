@@ -29,7 +29,7 @@ dependencies = ["typer[all]>=0.9"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 ''',
-            "src/{name_under}/__init__.py": '"""{ name } — a Python CLI."""\n__version__ = "0.1.0"\n',
+            "src/{name_under}/__init__.py": '"""{name} — a Python CLI."""\n__version__ = "0.1.0"\n',
             "src/{name_under}/cli.py": '''\
 """CLI entry point."""
 import typer
