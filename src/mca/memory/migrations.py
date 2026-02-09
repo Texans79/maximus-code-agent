@@ -153,6 +153,65 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_run_metrics_started ON mca.run_metrics(started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_run_metrics_success ON mca.run_metrics(success);
     """,
+
+    # Migration 5: confidence scoring columns on run_metrics
+    """\
+    ALTER TABLE mca.run_metrics ADD COLUMN IF NOT EXISTS confidence_score INTEGER;
+    ALTER TABLE mca.run_metrics ADD COLUMN IF NOT EXISTS spike_mode BOOLEAN DEFAULT FALSE;
+    """,
+
+    # Migration 6: knowledge graph tables
+    """\
+    CREATE TABLE IF NOT EXISTS mca.graph_nodes (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        workspace   TEXT NOT NULL,
+        node_type   TEXT NOT NULL
+                    CHECK (node_type IN ('file','function','class','module','dependency','endpoint','table')),
+        name        TEXT NOT NULL,
+        file_path   TEXT,
+        line_number INTEGER,
+        metadata    JSONB NOT NULL DEFAULT '{}',
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_nodes_unique
+        ON mca.graph_nodes (workspace, node_type, name, COALESCE(file_path, ''));
+    CREATE INDEX IF NOT EXISTS idx_graph_nodes_workspace ON mca.graph_nodes(workspace);
+    CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON mca.graph_nodes(node_type);
+    CREATE INDEX IF NOT EXISTS idx_graph_nodes_name ON mca.graph_nodes(name);
+
+    CREATE TABLE IF NOT EXISTS mca.graph_edges (
+        id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        source_id   UUID NOT NULL REFERENCES mca.graph_nodes(id) ON DELETE CASCADE,
+        target_id   UUID NOT NULL REFERENCES mca.graph_nodes(id) ON DELETE CASCADE,
+        edge_type   TEXT NOT NULL
+                    CHECK (edge_type IN ('imports','calls','extends','implements','depends_on','contains','defines')),
+        weight      REAL NOT NULL DEFAULT 1.0,
+        metadata    JSONB NOT NULL DEFAULT '{}',
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_edges_unique
+        ON mca.graph_edges (source_id, target_id, edge_type);
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON mca.graph_edges(source_id);
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON mca.graph_edges(target_id);
+    CREATE INDEX IF NOT EXISTS idx_graph_edges_type ON mca.graph_edges(edge_type);
+    """,
+
+    # Migration 7: journal table for run journaling
+    """\
+    CREATE TABLE IF NOT EXISTS mca.journal (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        task_id     UUID REFERENCES mca.tasks(id) ON DELETE SET NULL,
+        run_id      UUID NOT NULL,
+        seq         INTEGER NOT NULL,
+        phase       TEXT NOT NULL
+                    CHECK (phase IN ('start','preflight','plan','tool','checkpoint','cleanup','error','done','mass_fix')),
+        summary     TEXT NOT NULL,
+        detail      JSONB DEFAULT '{}',
+        created     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_journal_run ON mca.journal(run_id);
+    CREATE INDEX IF NOT EXISTS idx_journal_task ON mca.journal(task_id);
+    """,
 ]
 
 

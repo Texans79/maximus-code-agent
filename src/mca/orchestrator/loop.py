@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from mca.config import Config
 from mca.llm.client import LLMClient, LLMResponse, ToolCall, get_client
@@ -25,11 +27,34 @@ from mca.utils.secrets import redact
 log = get_logger("orchestrator")
 
 MAX_ITERATIONS = 15
+_CHECKPOINT_EVERY_N = 3  # Auto-checkpoint every N file-changing tool calls
 
 
-def _build_system_prompt(registry: ToolRegistry) -> str:
+def _detect_failure_pattern(failures: list[dict], min_count: int = 3) -> str | None:
+    """Detect repeated failure patterns from recent run metrics.
+
+    Groups failure_reason by first 50 chars and returns the pattern
+    if it occurs >= min_count times.
+    """
+    if not failures:
+        return None
+    reasons = [
+        (f.get("failure_reason") or "")[:50]
+        for f in failures
+        if f.get("failure_reason")
+    ]
+    if not reasons:
+        return None
+    counts = Counter(reasons)
+    most_common, count = counts.most_common(1)[0]
+    if count >= min_count:
+        return most_common
+    return None
+
+
+def _build_system_prompt(registry: ToolRegistry, spike_mode: bool = False) -> str:
     """Build dynamic system prompt — tools are passed structurally, not in text."""
-    return """\
+    base = """\
 You are Maximus Code Agent (MCA), an expert AI coding assistant.
 You operate on a workspace directory using the tools provided.
 
@@ -42,6 +67,15 @@ RULES:
 - Never leak secrets or environment variables.
 - Call done(summary) ONLY when you have verified changes work (tests pass).
 - If tests fail, do NOT call done. Fix the issue and retry."""
+    if spike_mode:
+        base += """
+
+SPIKE MODE ACTIVE (low confidence):
+- Start with the simplest possible approach.
+- Test each change immediately before proceeding.
+- If unsure, run_tests before making further changes.
+- Prefer small, incremental changes over large rewrites."""
+    return base
 
 
 def _build_context(registry: ToolRegistry) -> str:
@@ -125,7 +159,8 @@ def run_task(
     and sends results back as tool-role messages.
     """
     started_at = datetime.now(timezone.utc)
-    log.info("Starting task: %s", task)
+    run_id = str(uuid4())
+    log.info("Starting task: %s (run %s)", task, run_id[:8])
     log.info("Workspace: %s, Mode: %s", workspace, approval_mode)
 
     # ── Initialize memory store ──────────────────────────────────────────
@@ -140,10 +175,41 @@ def run_task(
     except Exception as e:
         log.warning("Memory store unavailable: %s", e)
 
+    # ── Journal init ─────────────────────────────────────────────────────
+    journal = None
+    try:
+        from mca.journal.writer import JournalWriter
+        journal = JournalWriter(store, task_id, run_id, workspace,
+                                task_description=task)
+        journal.log("start", f"Task: {task[:100]}")
+    except Exception as e:
+        log.warning("Journal init failed: %s", e)
+
     # ── Build registry ───────────────────────────────────────────────────
     registry = build_registry(workspace, config, memory_store=store)
-    system_prompt = _build_system_prompt(registry)
     tool_defs = registry.tool_definitions()
+
+    # ── Preflight checks ─────────────────────────────────────────────────
+    try:
+        from mca.preflight.checks import PreflightRunner
+        preflight = PreflightRunner(config, workspace, registry=registry, store=store)
+        pf_report = preflight.run_all()
+        if journal:
+            journal.log(
+                "preflight",
+                f"{pf_report.passed}✓ {pf_report.warned}! {pf_report.failed}✗",
+                pf_report.to_journal_detail(),
+            )
+        preflight.print_report(pf_report)
+        if not pf_report.ready:
+            if journal:
+                journal.log("error", "Preflight failed — aborting")
+                journal.close()
+            _finalize_task(store, task_id, False, "Preflight failed")
+            return {"success": False, "error": "Preflight failed",
+                    "report": pf_report.to_journal_detail()}
+    except Exception as e:
+        log.warning("Preflight checks failed: %s", e)
 
     # ── Git checkpoint ───────────────────────────────────────────────────
     git_tool = registry.get_tool("git")
@@ -159,6 +225,26 @@ def run_task(
 
     # ── LLM client ───────────────────────────────────────────────────────
     client = get_client(config)
+
+    # ── Mass fix detection ───────────────────────────────────────────────
+    mass_fix_prompt = ""
+    try:
+        if store and hasattr(store, "conn"):
+            from mca.memory.metrics import get_failures
+            failures = get_failures(store.conn, days=7)
+            pattern = _detect_failure_pattern(failures)
+            if pattern:
+                mass_fix_prompt = (
+                    f"\n\nPATTERN DETECTED: {len(failures)} recent failures with "
+                    f"similar cause: {pattern}.\n"
+                    "Before proceeding with the task, diagnose the root cause and "
+                    "fix the underlying issue. Do not apply individual workarounds."
+                )
+                if journal:
+                    journal.log("mass_fix", f"Pattern detected: {pattern}")
+                console.print(f"[warn]Mass fix pattern: {pattern}[/warn]")
+    except Exception as e:
+        log.debug("Mass fix detection skipped: %s", e)
 
     # ── Memory recall (inject similar past work) ─────────────────────────
     recall_context = ""
@@ -177,12 +263,42 @@ def run_task(
     except Exception as e:
         log.debug("Memory recall skipped: %s", e)
 
+    # ── Confidence scoring ───────────────────────────────────────────────
+    confidence_result = None
+    spike_mode = False
+    try:
+        from mca.orchestrator.confidence import calculate_confidence, should_spike
+        from mca.memory.embeddings import get_embedder
+        conf_embedder = get_embedder(config)
+        confidence_result = calculate_confidence(store, conf_embedder, task)
+        spike_mode = should_spike(confidence_result)
+        conf_embedder.close()
+        spike_label = " (SPIKE MODE)" if spike_mode else ""
+        console.print(f"[dim]Confidence: {confidence_result.total}/100{spike_label}[/dim]")
+        if spike_mode and approval_mode == "auto":
+            approval_mode = "ask"
+            console.print("[warn]Low confidence → switching to ask mode[/warn]")
+    except Exception as e:
+        log.debug("Confidence scoring skipped: %s", e)
+
+    # ── Graph recall (structural context) ───────────────────────────────
+    graph_context = ""
+    try:
+        if store and hasattr(store, "conn"):
+            from mca.memory.recall import graph_recall
+            graph_context = graph_recall(store.conn, str(workspace), task, max_nodes=10)
+            if graph_context:
+                log.info("Injected graph context (%d chars)", len(graph_context))
+    except Exception as e:
+        log.debug("Graph recall skipped: %s", e)
+
     # ── Build initial messages ───────────────────────────────────────────
+    system_prompt = _build_system_prompt(registry, spike_mode=spike_mode)
     context = _build_context(registry)
 
     messages: list[dict] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"{context}{recall_context}\n\nTask: {task}"},
+        {"role": "system", "content": system_prompt + mass_fix_prompt},
+        {"role": "user", "content": f"{context}{recall_context}{graph_context}\n\nTask: {task}"},
     ]
 
     # ── Plan approval ────────────────────────────────────────────────────
@@ -204,7 +320,9 @@ def run_task(
                                success=False, iterations=0, tool_calls=0,
                                files_changed=0, tests_runs=0, lint_runs=0,
                                rollback_used=bool(checkpoint_tag), failure_reason="Plan rejected by user",
-                               model=config.llm.model, client=client)
+                               model=config.llm.model, client=client,
+                               confidence_score=confidence_result.total if confidence_result else None,
+                               spike_mode=spike_mode)
             client.close()
             return {"success": False, "error": "Plan rejected by user"}
         messages.append({"role": "assistant", "content": plan_text})
@@ -218,6 +336,8 @@ def run_task(
                               output={"plan": messages[-1]["content"][:2000] if messages else ""})
         except Exception:
             pass
+    if journal:
+        journal.log("plan", "Plan approved" if approval_mode in ("ask", "paranoid") else "Auto-mode (no plan gate)")
 
     # ── Iteration loop ───────────────────────────────────────────────────
     last_summary = ""
@@ -229,6 +349,7 @@ def run_task(
     files_changed = 0
     rollback_used = False
     failure_reason = ""
+    checkpoint_counter = 0  # For continuous save
 
     for iteration in range(MAX_ITERATIONS):
         console.print(f"\n[bold cyan]── Iteration {iteration + 1}/{MAX_ITERATIONS} ──[/bold cyan]")
@@ -310,6 +431,7 @@ def run_task(
             tool_history.append({"tool": tc.name, "args": tc.arguments, "result": result})
 
             # ── Metric counters ───────────────────────────────────────
+            file_changed_this_step = False
             if tc.name == "run_tests":
                 tests_runs += 1
             elif tc.name in ("lint", "format_code"):
@@ -317,6 +439,7 @@ def run_task(
             elif tc.name in ("write_file", "edit_file", "replace_in_file"):
                 if result.get("ok"):
                     files_changed += 1
+                    file_changed_this_step = True
 
             messages.append({
                 "role": "tool",
@@ -333,6 +456,24 @@ def run_task(
                 except Exception:
                     pass
 
+            # Journal entry for tool call
+            result_summary = "OK" if result.get("ok") else result.get("error", "error")[:100]
+            if journal:
+                journal.log("tool", f"{tc.name}: {result_summary}",
+                            {"args": {k: str(v)[:200] for k, v in list(tc.arguments.items())[:5]}})
+
+            # Continuous save — checkpoint every N file-changing tool calls
+            if file_changed_this_step and git_tool and config.git.auto_checkpoint:
+                checkpoint_counter += 1
+                if checkpoint_counter % _CHECKPOINT_EVERY_N == 0:
+                    try:
+                        git_tool.execute("git_checkpoint",
+                                         {"message": f"MCA step {iteration + 1}: {tc.name}"})
+                        if journal:
+                            journal.log("checkpoint", f"Auto-saved at iteration {iteration + 1}")
+                    except Exception as e:
+                        log.debug("Auto-checkpoint failed: %s", e)
+
             # Print compact result
             if result.get("ok"):
                 console.print(f"    [green]OK[/green]")
@@ -345,50 +486,75 @@ def run_task(
             break
 
     # ── Finalize ─────────────────────────────────────────────────────────
-    if success:
-        console.print(f"\n[bold green]✓ Task complete: {last_summary}[/bold green]")
-        if checkpoint_tag and git_tool:
-            git_tool.execute("git_checkpoint", {"message": f"MCA done: {task[:60]}"})
+    try:
+        if success:
+            console.print(f"\n[bold green]✓ Task complete: {last_summary}[/bold green]")
+            if checkpoint_tag and git_tool:
+                git_tool.execute("git_checkpoint", {"message": f"MCA done: {task[:60]}"})
 
-        # Store outcome for future recall
+            # Store outcome for future recall
+            try:
+                from mca.memory.recall import store_outcome
+                from mca.memory.embeddings import get_embedder
+                embedder = get_embedder(config)
+                diff = ""
+                if git_tool:
+                    diff_result = git_tool.execute("git_diff", {})
+                    if diff_result.ok:
+                        diff = diff_result.data.get("diff_stat", "")
+                store_outcome(store, embedder, task_id or "unknown", last_summary,
+                              outcome="completed", diff=diff, project=str(workspace))
+                embedder.close()
+            except Exception as e:
+                log.debug("Outcome storage skipped: %s", e)
+
+        else:
+            failure_reason = "Max iterations reached without completion"
+            console.print("[bold red]✗ Max iterations reached without completion.[/bold red]")
+            if checkpoint_tag and git_tool:
+                console.print("[warn]Rolling back…[/warn]")
+                git_tool.execute("git_rollback", {})
+                rollback_used = True
+
+        # Journal — final entry
+        if journal:
+            summary_msg = last_summary if success else failure_reason
+            journal.log("done", f"Result: {'success' if success else 'failed'} — {summary_msg}")
+            journal.close()
+
+        _finalize_task(store, task_id, success, last_summary)
+        _write_run_metrics(store, task_id=task_id, started_at=started_at,
+                           success=success, iterations=iteration + 1,
+                           tool_calls=len(tool_history), files_changed=files_changed,
+                           tests_runs=tests_runs, lint_runs=lint_runs,
+                           rollback_used=rollback_used,
+                           failure_reason=failure_reason if not success else None,
+                           model=config.llm.model, client=client,
+                           confidence_score=confidence_result.total if confidence_result else None,
+                           spike_mode=spike_mode)
+        client.close()
+
+    finally:
+        # ── Cleanup (always runs) ────────────────────────────────────────
         try:
-            from mca.memory.recall import store_outcome
-            from mca.memory.embeddings import get_embedder
-            embedder = get_embedder(config)
-            diff = ""
-            if git_tool:
-                diff_result = git_tool.execute("git_diff", {})
-                if diff_result.ok:
-                    diff = diff_result.data.get("diff_stat", "")
-            store_outcome(store, embedder, task_id or "unknown", last_summary,
-                          outcome="completed", diff=diff, project=str(workspace))
-            embedder.close()
+            from mca.cleanup.hygiene import CleanupRunner
+            cleanup = CleanupRunner(workspace, config)
+            cleanup_report = cleanup.run_all()
+            if journal and (cleanup_report.orphans_killed or cleanup_report.temps_removed
+                            or cleanup_report.log_rotated or cleanup_report.journals_pruned):
+                # Journal might already be closed, so just log
+                log.info("Cleanup: orphans=%d temps=%d rotated=%s pruned=%d",
+                         cleanup_report.orphans_killed, cleanup_report.temps_removed,
+                         cleanup_report.log_rotated, cleanup_report.journals_pruned)
         except Exception as e:
-            log.debug("Outcome storage skipped: %s", e)
-
-    else:
-        failure_reason = "Max iterations reached without completion"
-        console.print("[bold red]✗ Max iterations reached without completion.[/bold red]")
-        if checkpoint_tag and git_tool:
-            console.print("[warn]Rolling back…[/warn]")
-            git_tool.execute("git_rollback", {})
-            rollback_used = True
-
-    _finalize_task(store, task_id, success, last_summary)
-    _write_run_metrics(store, task_id=task_id, started_at=started_at,
-                       success=success, iterations=iteration + 1,
-                       tool_calls=len(tool_history), files_changed=files_changed,
-                       tests_runs=tests_runs, lint_runs=lint_runs,
-                       rollback_used=rollback_used,
-                       failure_reason=failure_reason if not success else None,
-                       model=config.llm.model, client=client)
-    client.close()
+            log.debug("Cleanup failed: %s", e)
 
     return {
         "success": success,
         "summary": last_summary,
         "iterations": iteration + 1,
         "task_id": task_id,
+        "run_id": run_id,
         "tool_calls_made": len(tool_history),
     }
 
@@ -411,6 +577,7 @@ def _write_run_metrics(
     files_changed: int, tests_runs: int, lint_runs: int,
     rollback_used: bool, failure_reason: str | None,
     model: str | None, client: LLMClient | None = None,
+    confidence_score: int | None = None, spike_mode: bool = False,
 ) -> None:
     """Write a run_metrics row. Silently skips if store is unavailable."""
     if not store:
@@ -434,6 +601,8 @@ def _write_run_metrics(
             model=model,
             token_prompt=usage.get("prompt_tokens", 0),
             token_completion=usage.get("completion_tokens", 0),
+            confidence_score=confidence_score,
+            spike_mode=spike_mode,
         )
     except Exception as e:
         log.warning("Failed to write run metrics: %s", e)

@@ -31,6 +31,9 @@ app.add_typer(telegram_app, name="telegram")
 metrics_app = typer.Typer(help="Run metrics and telemetry.")
 app.add_typer(metrics_app, name="metrics")
 
+graph_app = typer.Typer(help="Knowledge graph commands.")
+app.add_typer(graph_app, name="graph")
+
 
 def _resolve_workspace(workspace: str | None) -> Path:
     # If explicit path given, use it directly
@@ -382,11 +385,15 @@ def metrics_last(
             pass
         fail_line = f"Failure: {r['failure_reason']}" if r.get("failure_reason") else ""
         task_short = r["task_id"][:8] if r["task_id"] else "n/a"
+        conf = r.get("confidence_score")
+        conf_str = f"{conf}/100" if conf is not None else "n/a"
+        spike_str = "Yes" if r.get("spike_mode") else "No"
         console.print(Panel(
             f"Status: {status}  |  Iterations: {r['iterations']}  |  "
             f"Tool calls: {r['tool_calls']}  |  Duration: {duration}\n"
             f"Files changed: {r['files_changed']}  |  Test runs: {r['tests_runs']}  |  "
             f"Lint runs: {r['lint_runs']}  |  Rollback: {r['rollback_used']}\n"
+            f"Confidence: {conf_str}  |  Spike mode: {spike_str}\n"
             f"Tokens: {r['token_prompt']} prompt + {r['token_completion']} completion\n"
             f"Model: {r['model'] or 'unknown'}  |  Task: {task_short}\n"
             f"{fail_line}",
@@ -419,6 +426,9 @@ def metrics_summary(
     table.add_row("Total test runs", str(s["total_test_runs"]))
     table.add_row("Total lint runs", str(s["total_lint_runs"]))
     table.add_row("Rollbacks", str(s["rollback_count"]))
+    avg_conf = s.get("avg_confidence")
+    table.add_row("Avg confidence", f"{avg_conf}/100" if avg_conf is not None else "n/a")
+    table.add_row("Spike mode runs", str(s.get("spike_count", 0)))
     table.add_row("Prompt tokens", f"{s['total_prompt_tokens']:,}")
     table.add_row("Completion tokens", f"{s['total_completion_tokens']:,}")
     console.print(table)
@@ -446,6 +456,218 @@ def metrics_failures(
             f"iters={r['iterations']}  tools={r['tool_calls']}  "
             f"reason={reason}"
         )
+
+
+# ── mca graph ────────────────────────────────────────────────────────────────
+@graph_app.command("build")
+def graph_build(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Target workspace dir."),
+) -> None:
+    """Build the knowledge graph for a workspace by parsing code structure."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.memory.graph import GraphStore
+    from mca.memory.graph_builder import build_graph
+
+    ws = _resolve_workspace(workspace)
+    cfg = load_config(workspace or ".")
+    store = get_store(cfg)
+
+    if store.backend_name != "postgres":
+        console.print("[error]Knowledge graph requires PostgreSQL backend[/error]")
+        raise typer.Exit(1)
+
+    console.print(f"[info]Building knowledge graph for {ws}…[/info]")
+    data = build_graph(ws)
+    graph_store = GraphStore(store.conn)
+    result = graph_store.build_graph(str(ws), data)
+    console.print(
+        f"[success]Graph built: {result['nodes']} nodes, {result['edges']} edges[/success]"
+    )
+
+
+@graph_app.command("query")
+def graph_query(
+    name: str = typer.Argument(..., help="Node name to search for."),
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+    node_type: Optional[str] = typer.Option(None, "--type", "-t",
+        help="Filter: file|function|class|module|dependency"),
+) -> None:
+    """Query the knowledge graph for a node and show its neighbors."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.memory.graph import GraphStore
+
+    ws = _resolve_workspace(workspace)
+    cfg = load_config(workspace or ".")
+    store = get_store(cfg)
+
+    if store.backend_name != "postgres":
+        console.print("[error]Knowledge graph requires PostgreSQL backend[/error]")
+        raise typer.Exit(1)
+
+    graph_store = GraphStore(store.conn)
+    nodes = graph_store.find_by_name(str(ws), name, node_type=node_type)
+
+    if not nodes:
+        console.print(f"[dim]No nodes matching '{name}' found.[/dim]")
+        return
+
+    for node in nodes[:5]:
+        loc = f" ({node['file_path']}:{node['line_number']})" if node.get("file_path") else ""
+        console.print(f"\n[bold]{node['node_type']}[/bold] {node['name']}{loc}")
+
+        neighbors = graph_store.get_neighbors(node["id"], limit=20)
+        if neighbors:
+            table = Table(show_header=True, header_style="bold cyan")
+            table.add_column("Direction")
+            table.add_column("Edge")
+            table.add_column("Type")
+            table.add_column("Name")
+            table.add_column("File")
+            for nb in neighbors:
+                table.add_row(
+                    nb["direction"], nb["edge_type"],
+                    nb["node_type"], nb["name"],
+                    nb.get("file_path") or "",
+                )
+            console.print(table)
+        else:
+            console.print("  [dim]No connections[/dim]")
+
+
+@graph_app.command("stats")
+def graph_stats(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Show knowledge graph summary statistics."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.memory.graph import GraphStore
+
+    ws = _resolve_workspace(workspace)
+    cfg = load_config(workspace or ".")
+    store = get_store(cfg)
+
+    if store.backend_name != "postgres":
+        console.print("[error]Knowledge graph requires PostgreSQL backend[/error]")
+        raise typer.Exit(1)
+
+    graph_store = GraphStore(store.conn)
+    stats = graph_store.get_stats(str(ws))
+
+    table = Table(title=f"Knowledge Graph — {ws.name}", show_header=True, header_style="bold cyan")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+
+    table.add_row("Total nodes", str(stats["total_nodes"]))
+    table.add_row("Total edges", str(stats["total_edges"]))
+    for ntype, count in stats["nodes_by_type"].items():
+        table.add_row(f"  {ntype}", str(count))
+    for etype, count in stats["edges_by_type"].items():
+        table.add_row(f"  {etype}", str(count))
+
+    console.print(table)
+
+
+# ── mca journal ──────────────────────────────────────────────────────────────
+@app.command()
+def journal(
+    run_id: Optional[str] = typer.Argument(None, help="Run ID (default: latest)."),
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Show the journal for a run (default: latest)."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    cfg = load_config(workspace or ".")
+    store = get_store(cfg)
+    if store.backend_name != "postgres":
+        console.print("[error]Journal requires PostgreSQL backend[/error]")
+        raise typer.Exit(1)
+
+    if not run_id:
+        run_id = store.get_latest_journal_run_id()
+        if not run_id:
+            console.print("[dim]No journal entries found.[/dim]")
+            return
+
+    entries = store.get_journal(run_id)
+    if not entries:
+        console.print(f"[dim]No journal entries for run {run_id[:8]}.[/dim]")
+        return
+
+    console.print(Panel(
+        f"[bold]Run:[/bold] {run_id[:8]}\n"
+        f"[bold]Entries:[/bold] {len(entries)}",
+        title="MCA Run Journal",
+        border_style="cyan",
+    ))
+    for e in entries:
+        phase = e["phase"]
+        if phase == "error":
+            style = "[red]"
+        elif phase == "done":
+            style = "[green]"
+        elif phase in ("preflight", "checkpoint"):
+            style = "[cyan]"
+        else:
+            style = "[dim]"
+        console.print(
+            f"  {style}[{e['seq']:>3}] {phase:<12}[/{style.strip('[]')}] {e['summary']}"
+        )
+
+
+# ── mca preflight ────────────────────────────────────────────────────────────
+@app.command()
+def preflight(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Run preflight checks on the workspace."""
+    from mca.config import load_config
+    from mca.memory.base import get_store
+    from mca.tools.registry import build_registry
+    from mca.preflight.checks import PreflightRunner
+
+    ws = _resolve_workspace(workspace)
+    cfg = load_config(workspace or ".")
+    store = None
+    try:
+        store = get_store(cfg)
+    except Exception:
+        pass
+    registry = build_registry(ws, cfg, memory_store=store)
+
+    runner = PreflightRunner(cfg, ws, registry=registry, store=store)
+    report = runner.run_all()
+    runner.print_report(report)
+
+    if not report.ready:
+        raise typer.Exit(1)
+
+
+# ── mca cleanup ──────────────────────────────────────────────────────────────
+@app.command()
+def cleanup(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+) -> None:
+    """Run post-task cleanup (orphans, temps, logs, old journals)."""
+    from mca.cleanup.hygiene import CleanupRunner
+
+    ws = _resolve_workspace(workspace)
+    runner = CleanupRunner(ws)
+    report = runner.run_all()
+
+    table = Table(title="Cleanup Report", show_header=True, header_style="bold cyan")
+    table.add_column("Action", style="bold")
+    table.add_column("Result", justify="right")
+    table.add_row("Orphans killed", str(report.orphans_killed))
+    table.add_row("Temps removed", str(report.temps_removed))
+    table.add_row("Log rotated", "Yes" if report.log_rotated else "No")
+    table.add_row("Journals pruned", str(report.journals_pruned))
+    if report.errors:
+        for err in report.errors:
+            table.add_row("[red]Error[/red]", err)
+    console.print(table)
 
 
 if __name__ == "__main__":

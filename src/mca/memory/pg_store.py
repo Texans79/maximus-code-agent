@@ -281,6 +281,48 @@ class PgMemoryStore(MemoryStore):
         ).fetchone()
         return row[0]
 
+    # ── Journal ──────────────────────────────────────────────────────────
+
+    def add_journal_entry(self, task_id: str | None, run_id: str,
+                          seq: int, phase: str, summary: str,
+                          detail: dict | None = None) -> str:
+        row = self.conn.execute(
+            """\
+            INSERT INTO mca.journal (task_id, run_id, seq, phase, summary, detail)
+            VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
+            RETURNING id::text
+            """,
+            (task_id, run_id, seq, phase, summary, json.dumps(detail or {})),
+        ).fetchone()
+        return row[0]
+
+    def get_journal(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """\
+            SELECT id::text, task_id::text, run_id::text, seq, phase,
+                   summary, detail, created
+            FROM mca.journal
+            WHERE run_id = %s::uuid
+            ORDER BY seq
+            """,
+            (run_id,),
+        ).fetchall()
+        return [
+            {
+                "id": r[0], "task_id": r[1], "run_id": r[2], "seq": r[3],
+                "phase": r[4], "summary": r[5],
+                "detail": r[6] if isinstance(r[6], dict) else json.loads(r[6] or "{}"),
+                "created": str(r[7]),
+            }
+            for r in rows
+        ]
+
+    def get_latest_journal_run_id(self) -> str | None:
+        row = self.conn.execute(
+            "SELECT DISTINCT run_id::text FROM mca.journal ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        return row[0] if row else None
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def close(self) -> None:

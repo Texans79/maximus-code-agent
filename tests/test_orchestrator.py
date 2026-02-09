@@ -5,7 +5,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mca.orchestrator.approval import ApprovalDenied, ApprovalMode, approve_plan
-from mca.orchestrator.loop import _execute_tool, _build_system_prompt, _validate_done, _build_context
+from mca.orchestrator.loop import (
+    _execute_tool, _build_system_prompt, _validate_done, _build_context,
+    _detect_failure_pattern,
+)
 from mca.llm.client import ToolCall
 
 
@@ -214,3 +217,51 @@ class TestBuildContext:
         ctx = _build_context(registry)
         assert "foo.py" in ctx
         assert "bar.py" in ctx
+
+
+class TestDetectFailurePattern:
+    def test_no_failures(self):
+        assert _detect_failure_pattern([]) is None
+
+    def test_no_pattern_below_threshold(self):
+        failures = [
+            {"failure_reason": "Error A happened"},
+            {"failure_reason": "Error B happened"},
+        ]
+        assert _detect_failure_pattern(failures) is None
+
+    def test_detects_repeated_pattern(self):
+        failures = [
+            {"failure_reason": "Max iterations reached without completion"},
+            {"failure_reason": "Max iterations reached without completion"},
+            {"failure_reason": "Max iterations reached without completion"},
+        ]
+        pattern = _detect_failure_pattern(failures)
+        assert pattern is not None
+        assert "Max iterations" in pattern
+
+    def test_groups_by_first_50_chars(self):
+        failures = [
+            {"failure_reason": "Connection refused: database server not responding on port 5432"},
+            {"failure_reason": "Connection refused: database server not responding on port 5433"},
+            {"failure_reason": "Connection refused: database server not responding on port 5434"},
+        ]
+        pattern = _detect_failure_pattern(failures)
+        assert pattern is not None
+        assert "Connection refused" in pattern
+
+    def test_ignores_none_reasons(self):
+        failures = [
+            {"failure_reason": None},
+            {"failure_reason": None},
+            {"failure_reason": None},
+        ]
+        assert _detect_failure_pattern(failures) is None
+
+    def test_custom_min_count(self):
+        failures = [
+            {"failure_reason": "Error X"},
+            {"failure_reason": "Error X"},
+        ]
+        assert _detect_failure_pattern(failures, min_count=2) is not None
+        assert _detect_failure_pattern(failures, min_count=3) is None
