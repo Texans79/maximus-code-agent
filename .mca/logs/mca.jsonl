@@ -126,3 +126,15 @@
 {"ts": "2026-02-09T22:55:53.416395+00:00", "level": "INFO", "module": "mca.safe_shell", "msg": "exit=0 duration=0.0s stdout=14 stderr=0"}
 {"ts": "2026-02-09T22:55:53.474367+00:00", "level": "INFO", "module": "mca.safe_shell", "msg": "exec: ruff --version"}
 {"ts": "2026-02-09T22:55:53.475104+00:00", "level": "INFO", "module": "mca.safe_shell", "msg": "exit=127 duration=0.0s stdout=0 stderr=28"}
+{"ts": "2026-02-09T22:55:53.510037+00:00", "level": "INFO", "module": "mca.git_ops", "msg": "checkpoint: mca-checkpoint-20260209-175553-500"}
+{"ts": "2026-02-09T22:55:53.552207+00:00", "level": "WARNING", "module": "mca.memory.recall", "msg": "vector recall failed, falling back to FTS: Ollama embedding failed: [Errno 111] Connection refused"}
+{"ts": "2026-02-09T22:55:53.565266+00:00", "level": "INFO", "module": "mca.confidence", "msg": "confidence=41 (sim=30 fail=100 nov=20) similar=0 recent_rate=100%"}
+{"ts": "2026-02-09T23:01:28.289256+00:00", "level": "INFO", "module": "mca.orchestrator", "msg": "Starting task: list files (run 9c930102)"}
+{"ts": "2026-02-09T23:01:28.289301+00:00", "level": "INFO", "module": "mca.orchestrator", "msg": "Workspace: /home/texans79/maximus-code-agent, Mode: auto"}
+{"ts": "2026-02-09T23:01:28.326290+00:00", "level": "INFO", "module": "mca.memory.pg", "msg": "PostgreSQL memory store connected"}
+{"ts": "2026-02-09T23:01:28.326395+00:00", "level": "INFO", "module": "mca.memory", "msg": "Connected to PostgreSQL: localhost:5432/openwebui?options=-csearch_path%3Dmca,public"}
+{"ts": "2026-02-09T23:01:28.327888+00:00", "level": "INFO", "module": "mca.orchestrator", "msg": "Task recorded: dd5a7a68"}
+{"ts": "2026-02-09T23:01:28.351950+00:00", "level": "INFO", "module": "mca.safe_shell", "msg": "exec: echo mca-verify-ok"}
+{"ts": "2026-02-09T23:01:28.352643+00:00", "level": "INFO", "module": "mca.safe_shell", "msg": "exit=0 duration=0.0s stdout=14 stderr=0"}
+{"ts": "2026-02-09T23:01:28.408266+00:00", "level": "INFO", "module": "mca.safe_shell", "msg": "exec: ruff --version"}
+{"ts": "2026-02-09T23:01:28.409053+00:00", "level": "INFO", "module": "mca.safe_shell", "msg": "exit=127 duration=0.0s stdout=0 stderr=28"}
