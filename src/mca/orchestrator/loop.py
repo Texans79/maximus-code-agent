@@ -276,7 +276,8 @@ def run_task(
         spike_label = " (SPIKE MODE)" if spike_mode else ""
         console.print(f"[dim]Confidence: {confidence_result.total}/100{spike_label}[/dim]")
         if spike_mode and approval_mode == "auto":
-            console.print("[warn]Low confidence — spike mode active (auto mode preserved)[/warn]")
+            approval_mode = "ask"
+            console.print("[warn]Low confidence → switching to ask mode[/warn]")
     except Exception as e:
         log.debug("Confidence scoring skipped: %s", e)
 
