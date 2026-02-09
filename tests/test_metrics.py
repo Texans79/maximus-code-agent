@@ -16,6 +16,7 @@ class TestRowToDict:
             datetime(2025, 1, 1, tzinfo=timezone.utc),
             datetime(2025, 1, 1, 0, 5, tzinfo=timezone.utc),
             True, 7, 12, 3, 2, 1, False, None, "qwen-72b", 5000, 3000,
+            75, False,
         )
         d = _row_to_dict(row)
         assert d["id"] == "abc-123"
@@ -31,6 +32,8 @@ class TestRowToDict:
         assert d["model"] == "qwen-72b"
         assert d["token_prompt"] == 5000
         assert d["token_completion"] == 3000
+        assert d["confidence_score"] == 75
+        assert d["spike_mode"] is False
 
     def test_failure_row(self):
         row = (
@@ -39,12 +42,27 @@ class TestRowToDict:
             datetime(2025, 1, 2, 0, 10, tzinfo=timezone.utc),
             False, 15, 30, 0, 3, 0, True,
             "Max iterations reached", "qwen-72b", 8000, 6000,
+            30, True,
         )
         d = _row_to_dict(row)
         assert d["success"] is False
         assert d["rollback_used"] is True
         assert d["failure_reason"] == "Max iterations reached"
         assert d["task_id"] is None
+        assert d["confidence_score"] == 30
+        assert d["spike_mode"] is True
+
+    def test_row_without_confidence_columns(self):
+        """Rows from before migration 5 have only 15 columns."""
+        row = (
+            "abc-old", "task-old",
+            datetime(2025, 1, 1, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 0, 5, tzinfo=timezone.utc),
+            True, 5, 8, 1, 1, 0, False, None, "qwen-72b", 3000, 1500,
+        )
+        d = _row_to_dict(row)
+        assert d["id"] == "abc-old"
+        assert "confidence_score" not in d
 
 
 class TestWriteMetrics:
@@ -109,12 +127,14 @@ class TestGetLast:
         conn = MagicMock()
         now = datetime.now(timezone.utc)
         conn.execute.return_value.fetchall.return_value = [
-            ("id-1", "task-1", now, now, True, 5, 10, 2, 1, 0, False, None, "qwen", 3000, 1500),
+            ("id-1", "task-1", now, now, True, 5, 10, 2, 1, 0, False, None, "qwen", 3000, 1500, 80, False),
         ]
         results = get_last(conn, limit=1)
         assert len(results) == 1
         assert results[0]["id"] == "id-1"
         assert results[0]["success"] is True
+        assert results[0]["confidence_score"] == 80
+        assert results[0]["spike_mode"] is False
 
     def test_returns_empty_list(self):
         conn = MagicMock()
@@ -127,7 +147,7 @@ class TestGetSummary:
     def test_returns_aggregated_stats(self):
         conn = MagicMock()
         conn.execute.return_value.fetchone.return_value = (
-            10, 8, 2, 80.0, 6.5, 15.2, 50000, 30000, 45.3, 12, 3, 1,
+            10, 8, 2, 80.0, 6.5, 15.2, 50000, 30000, 45.3, 12, 3, 1, 72, 2,
         )
         s = get_summary(conn, days=7)
         assert s["total_runs"] == 10
@@ -140,16 +160,20 @@ class TestGetSummary:
         assert s["total_completion_tokens"] == 30000
         assert s["avg_duration_s"] == 45.3
         assert s["rollback_count"] == 1
+        assert s["avg_confidence"] == 72
+        assert s["spike_count"] == 2
 
     def test_zero_runs(self):
         conn = MagicMock()
         conn.execute.return_value.fetchone.return_value = (
-            0, 0, 0, 0.0, None, None, 0, 0, None, 0, 0, 0,
+            0, 0, 0, 0.0, None, None, 0, 0, None, 0, 0, 0, None, 0,
         )
         s = get_summary(conn, days=30)
         assert s["total_runs"] == 0
         assert s["avg_iterations"] == 0.0
         assert s["avg_duration_s"] == 0.0
+        assert s["avg_confidence"] is None
+        assert s["spike_count"] == 0
 
 
 class TestGetFailures:
@@ -158,12 +182,14 @@ class TestGetFailures:
         now = datetime.now(timezone.utc)
         conn.execute.return_value.fetchall.return_value = [
             ("id-f1", "task-f1", now, now, False, 15, 30, 0, 3, 0, True,
-             "Max iterations", "qwen", 8000, 6000),
+             "Max iterations", "qwen", 8000, 6000, 25, True),
         ]
         results = get_failures(conn, days=30)
         assert len(results) == 1
         assert results[0]["success"] is False
         assert results[0]["failure_reason"] == "Max iterations"
+        assert results[0]["confidence_score"] == 25
+        assert results[0]["spike_mode"] is True
 
     def test_no_failures(self):
         conn = MagicMock()

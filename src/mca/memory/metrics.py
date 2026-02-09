@@ -15,23 +15,28 @@ def write_metrics(conn, *, task_id: str | None, started_at: datetime,
                   tool_calls: int, files_changed: int, tests_runs: int,
                   lint_runs: int, rollback_used: bool,
                   failure_reason: str | None, model: str | None,
-                  token_prompt: int, token_completion: int) -> str:
+                  token_prompt: int, token_completion: int,
+                  confidence_score: int | None = None,
+                  spike_mode: bool = False) -> str:
     """Insert a run_metrics row. Returns the row id."""
     row = conn.execute(
         """\
         INSERT INTO mca.run_metrics
             (task_id, started_at, ended_at, success, iterations, tool_calls,
              files_changed, tests_runs, lint_runs, rollback_used,
-             failure_reason, model, token_prompt, token_completion)
-        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             failure_reason, model, token_prompt, token_completion,
+             confidence_score, spike_mode)
+        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id::text
         """,
         (task_id, started_at, ended_at, success, iterations, tool_calls,
          files_changed, tests_runs, lint_runs, rollback_used,
-         failure_reason, model, token_prompt, token_completion),
+         failure_reason, model, token_prompt, token_completion,
+         confidence_score, spike_mode),
     ).fetchone()
     mid = row[0]
-    log.info("wrote run_metrics %s (success=%s, iters=%d)", mid[:8], success, iterations)
+    log.info("wrote run_metrics %s (success=%s, iters=%d, confidence=%s)",
+             mid[:8], success, iterations, confidence_score)
     return mid
 
 
@@ -41,7 +46,8 @@ def get_last(conn, limit: int = 1) -> list[dict[str, Any]]:
         """\
         SELECT id::text, task_id::text, started_at, ended_at, success,
                iterations, tool_calls, files_changed, tests_runs, lint_runs,
-               rollback_used, failure_reason, model, token_prompt, token_completion
+               rollback_used, failure_reason, model, token_prompt, token_completion,
+               confidence_score, spike_mode
         FROM mca.run_metrics
         ORDER BY started_at DESC
         LIMIT %s
@@ -69,7 +75,9 @@ def get_summary(conn, days: int = 7) -> dict[str, Any]:
                                                         AS avg_duration_s,
             SUM(tests_runs)                             AS total_test_runs,
             SUM(lint_runs)                              AS total_lint_runs,
-            COUNT(*) FILTER (WHERE rollback_used)       AS rollback_count
+            COUNT(*) FILTER (WHERE rollback_used)       AS rollback_count,
+            ROUND(AVG(confidence_score)::numeric, 0)    AS avg_confidence,
+            COUNT(*) FILTER (WHERE spike_mode)          AS spike_count
         FROM mca.run_metrics
         WHERE started_at >= NOW() - make_interval(days => %s)
         """,
@@ -89,6 +97,8 @@ def get_summary(conn, days: int = 7) -> dict[str, Any]:
         "total_test_runs": int(row[9] or 0),
         "total_lint_runs": int(row[10] or 0),
         "rollback_count": int(row[11]),
+        "avg_confidence": int(row[12]) if row[12] is not None else None,
+        "spike_count": int(row[13]),
     }
 
 
@@ -98,7 +108,8 @@ def get_failures(conn, days: int = 30) -> list[dict[str, Any]]:
         """\
         SELECT id::text, task_id::text, started_at, ended_at, success,
                iterations, tool_calls, files_changed, tests_runs, lint_runs,
-               rollback_used, failure_reason, model, token_prompt, token_completion
+               rollback_used, failure_reason, model, token_prompt, token_completion,
+               confidence_score, spike_mode
         FROM mca.run_metrics
         WHERE NOT success
           AND started_at >= NOW() - make_interval(days => %s)
@@ -110,7 +121,7 @@ def get_failures(conn, days: int = 30) -> list[dict[str, Any]]:
 
 
 def _row_to_dict(row) -> dict[str, Any]:
-    return {
+    d = {
         "id": row[0],
         "task_id": row[1],
         "started_at": str(row[2]),
@@ -127,3 +138,8 @@ def _row_to_dict(row) -> dict[str, Any]:
         "token_prompt": row[13],
         "token_completion": row[14],
     }
+    # Confidence columns (added in migration 5)
+    if len(row) > 15:
+        d["confidence_score"] = row[15]
+        d["spike_mode"] = row[16]
+    return d
