@@ -108,6 +108,11 @@ def build_registry(
     if memory_store:
         reg.register(MemoryTool(memory_store))
 
+    # Database (read-only SQL) — requires PostgreSQL connection
+    if memory_store and hasattr(memory_store, "conn"):
+        from mca.tools.db_tool import DbTool
+        reg.register(DbTool(memory_store.conn))
+
     # Multipliers
     reg.register(TestRunner(shell, ws))
     reg.register(RepoIndexer(ws))

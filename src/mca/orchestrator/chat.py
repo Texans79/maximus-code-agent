@@ -32,6 +32,7 @@ _READ_ONLY_TOOLS = frozenset({
     "read_file", "list_files", "search", "run_command",
     "git_log", "git_diff", "memory_search", "run_tests",
     "system_info", "index_repo",
+    "query_db", "list_tables", "describe_table",
 })
 
 # Additional tools enabled with --write
