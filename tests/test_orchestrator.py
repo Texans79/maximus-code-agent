@@ -7,7 +7,8 @@ import pytest
 from mca.orchestrator.approval import ApprovalDenied, ApprovalMode, approve_plan
 from mca.orchestrator.loop import (
     _execute_tool, _build_system_prompt, _validate_done, _build_context,
-    _detect_failure_pattern,
+    _detect_failure_pattern, _summarize_tool_history, _detect_stuck,
+    _needs_auto_read, MAX_ITERATIONS,
 )
 from mca.llm.client import ToolCall
 
@@ -265,3 +266,131 @@ class TestDetectFailurePattern:
         ]
         assert _detect_failure_pattern(failures, min_count=2) is not None
         assert _detect_failure_pattern(failures, min_count=3) is None
+
+
+class TestSummarizeToolHistory:
+    def test_empty_history(self):
+        result = _summarize_tool_history([])
+        assert "no tool calls" in result.lower()
+
+    def test_single_ok_entry(self):
+        history = [{"tool": "read_file", "args": {"path": "main.py"}, "result": {"ok": True}}]
+        result = _summarize_tool_history(history)
+        assert "read_file" in result
+        assert "OK" in result
+
+    def test_failed_entry_shows_error(self):
+        history = [{"tool": "run_command", "args": {"command": "ls"}, "result": {"ok": False, "error": "Permission denied"}}]
+        result = _summarize_tool_history(history)
+        assert "FAIL" in result
+        assert "Permission denied" in result
+
+    def test_truncates_long_history(self):
+        history = [{"tool": f"tool_{i}", "args": {}, "result": {"ok": True}} for i in range(30)]
+        result = _summarize_tool_history(history, max_entries=5)
+        lines = [l for l in result.strip().split("\n") if l.strip()]
+        assert len(lines) == 5
+
+
+class TestDetectStuck:
+    def test_not_stuck_with_few_entries(self):
+        history = [{"tool": "read_file", "args": {"path": "a.py"}, "result": {"ok": True}}]
+        assert _detect_stuck(history) is None
+
+    def test_not_stuck_with_different_tools(self):
+        history = [
+            {"tool": "read_file", "args": {"path": "a.py"}, "result": {"ok": True}},
+            {"tool": "search", "args": {"pattern": "foo"}, "result": {"ok": True}},
+            {"tool": "list_files", "args": {}, "result": {"ok": True}},
+        ]
+        assert _detect_stuck(history) is None
+
+    def test_stuck_same_tool_same_args(self):
+        history = [
+            {"tool": "replace_in_file", "args": {"path": "a.py", "old_text": "x"}, "result": {"ok": False}},
+            {"tool": "replace_in_file", "args": {"path": "a.py", "old_text": "x"}, "result": {"ok": False}},
+            {"tool": "replace_in_file", "args": {"path": "a.py", "old_text": "x"}, "result": {"ok": False}},
+        ]
+        result = _detect_stuck(history)
+        assert result is not None
+        assert result[0] == "replace_in_file"
+        assert result[1] == 3
+
+    def test_not_stuck_same_tool_different_args(self):
+        history = [
+            {"tool": "read_file", "args": {"path": "a.py"}, "result": {"ok": True}},
+            {"tool": "read_file", "args": {"path": "b.py"}, "result": {"ok": True}},
+            {"tool": "read_file", "args": {"path": "c.py"}, "result": {"ok": True}},
+        ]
+        assert _detect_stuck(history) is None
+
+
+class TestNeedsAutoRead:
+    def test_non_edit_tool_no_read(self):
+        assert _needs_auto_read("read_file", {"path": "a.py"}, []) is None
+        assert _needs_auto_read("list_files", {}, []) is None
+        assert _needs_auto_read("run_tests", {}, []) is None
+
+    def test_edit_without_prior_read(self):
+        result = _needs_auto_read("replace_in_file", {"path": "main.py"}, [])
+        assert result == "main.py"
+
+    def test_edit_with_prior_read(self):
+        history = [{"tool": "read_file", "args": {"path": "main.py"}, "result": {"ok": True}}]
+        result = _needs_auto_read("replace_in_file", {"path": "main.py"}, history)
+        assert result is None
+
+    def test_edit_file_also_checked(self):
+        result = _needs_auto_read("edit_file", {"path": "foo.py"}, [])
+        assert result == "foo.py"
+
+    def test_different_file_still_needs_read(self):
+        history = [{"tool": "read_file", "args": {"path": "other.py"}, "result": {"ok": True}}]
+        result = _needs_auto_read("replace_in_file", {"path": "main.py"}, history)
+        assert result == "main.py"
+
+    def test_no_path_in_args(self):
+        assert _needs_auto_read("edit_file", {}, []) is None
+
+
+class TestMaxIterationsChanged:
+    def test_max_iterations_is_25(self):
+        assert MAX_ITERATIONS == 25
+
+
+class TestBuildSystemPromptDelegation:
+    """Verify the _build_system_prompt wrapper still works for existing callers."""
+
+    def test_basic_prompt(self, tmp_path):
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": [], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        registry = build_registry(tmp_path, cfg)
+        prompt = _build_system_prompt(registry)
+        assert "Maximus Code Agent" in prompt
+        assert "THINKING DISCIPLINE" in prompt
+
+    def test_with_workspace_name(self, tmp_path):
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": [], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        registry = build_registry(tmp_path, cfg)
+        prompt = _build_system_prompt(registry, workspace_name="test-project")
+        assert "test-project" in prompt
+
+    def test_spike_mode(self, tmp_path):
+        from mca.config import Config
+        from mca.tools.registry import build_registry
+        cfg = Config({
+            "shell": {"denylist": [], "allowlist": [], "timeout": 30},
+            "git": {"auto_checkpoint": False, "branch_prefix": "mca/"},
+        })
+        registry = build_registry(tmp_path, cfg)
+        prompt = _build_system_prompt(registry, spike_mode=True)
+        assert "SPIKE MODE" in prompt

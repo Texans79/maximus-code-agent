@@ -77,6 +77,23 @@ def run(
         raise typer.Exit(1)
 
 
+# ── mca chat ────────────────────────────────────────────────────────────────
+@app.command()
+def chat(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Target workspace dir."),
+    write: bool = typer.Option(False, "--write", help="Enable write tools (edit, write_file, etc.)."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Start an interactive chat session with tool access."""
+    setup_logging(log_dir=".mca/logs", verbose=verbose)
+    from mca.config import load_config
+    cfg = load_config(workspace or ".")
+    ws = _resolve_workspace(workspace)
+
+    from mca.orchestrator.chat import run_chat
+    run_chat(workspace=ws, config=cfg, write_enabled=write)
+
+
 # ── mca status ───────────────────────────────────────────────────────────────
 @app.command()
 def status(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
