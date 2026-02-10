@@ -94,6 +94,30 @@ def chat(
     run_chat(workspace=ws, config=cfg, write_enabled=write)
 
 
+# ── mca serve ───────────────────────────────────────────────────────────────
+@app.command()
+def serve(
+    workspace: Optional[str] = typer.Option(None, "--workspace", "-w", help="Target workspace dir."),
+    port: int = typer.Option(8002, "--port", "-p", help="Port to listen on."),
+    host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Start the OpenAI-compatible API server for Open WebUI integration."""
+    setup_logging(log_dir=".mca/logs", verbose=verbose)
+    from mca.config import load_config
+    cfg = load_config(workspace or ".")
+    ws = _resolve_workspace(workspace)
+
+    from mca.server import app as api_app, init_resources
+    init_resources(workspace=ws, config=cfg)
+
+    console.print(f"[bold cyan]MCA API Server[/bold cyan] — {ws.name} on {host}:{port}")
+    console.print("[dim]Add to Open WebUI: Connections → OpenAI → http://host.docker.internal:{port}/v1[/dim]")
+
+    import uvicorn
+    uvicorn.run(api_app, host=host, port=port, log_level="info")
+
+
 # ── mca status ───────────────────────────────────────────────────────────────
 @app.command()
 def status(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:

@@ -17,8 +17,12 @@ git:
   branch_prefix: "mca/"
 
 memory:
-  backend: sqlite
+  backend: postgres
   sqlite_path: ".mca/memory.db"
+
+telegram:
+  token: "8375198069:AAFiHQZUIqXaE-9aWFhbZLJ8hdDHdz1_rkQ"
+  allowed_users: []
 
 style:
   indent: 4
