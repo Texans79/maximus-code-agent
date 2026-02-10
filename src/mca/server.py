@@ -116,8 +116,10 @@ async def chat_completions(request: Request) -> JSONResponse:
     chat_tools = res["chat_tools"]
     system_prompt = res["system_prompt"]
 
-    # Prepend system prompt if not already present
-    if not messages or messages[0].get("role") != "system":
+    # Always use MCA's system prompt (replace any Open WebUI default)
+    if messages and messages[0].get("role") == "system":
+        messages[0]["content"] = system_prompt
+    else:
         messages = [{"role": "system", "content": system_prompt}] + messages
 
     # Tool loop — up to 5 rounds
